@@ -237,7 +237,8 @@ async fn kinesis_retry_failed_records_on_partial_failure() {
         .delete_stream()
         .stream_name(stream.clone())
         .send()
-        .await;
+        .await
+        .expect("Failed to delete stream");
 
     // Wait for deletion
     sleep(Duration::from_secs(1)).await;
