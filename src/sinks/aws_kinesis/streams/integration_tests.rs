@@ -5,15 +5,32 @@ use aws_sdk_kinesis::types::{Record, ShardIteratorType};
 use aws_smithy_types::DateTime;
 use futures::StreamExt;
 
+use aws_smithy_runtime_api::client::{orchestrator::HttpResponse, result::SdkError};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::time::{Duration, sleep};
 use vector_lib::codecs::TextSerializerConfig;
 use vector_lib::lookup::lookup_v2::ConfigValuePath;
 
-use super::{config::KinesisClientBuilder, *};
+use super::{
+    KinesisError, KinesisRecord, KinesisResponse, KinesisSinkBaseConfig, build_sink,
+    config::{
+        KinesisClientBuilder, KinesisDefaultBatchSettings, KinesisRetryLogic,
+        KinesisStreamsSinkConfig, MAX_PAYLOAD_EVENTS, MAX_PAYLOAD_SIZE,
+    },
+    record::{KinesisStreamClient, KinesisStreamRecord},
+};
+use crate::sinks::aws_kinesis::sink::BatchKinesisRequest;
 use crate::{
     aws::{AwsAuthentication, RegionOrEndpoint, create_client},
     config::{ProxyConfig, SinkConfig, SinkContext},
-    sinks::util::{BatchConfig, Compression},
+    sinks::{
+        VectorSink,
+        util::{
+            BatchConfig, Compression,
+            retries::{RetryAction, RetryLogic},
+        },
+    },
     test_util::{
         components::{AWS_SINK_TAGS, run_and_assert_sink_compliance},
         random_lines_with_stream, random_string,
@@ -24,12 +41,128 @@ fn kinesis_address() -> String {
     std::env::var("KINESIS_ADDRESS").unwrap_or_else(|_| "http://localhost:4566".into())
 }
 
-/// Configure localstack to be more aggressive about throttling
-fn setup_localstack_for_partial_failures() {
-    unsafe {
-        // Set environment variables that make localstack more likely to throttle
-        std::env::set_var("KINESIS_ERROR_PROBABILITY", "0.3"); // 30% error rate
+/// Instrumented retry logic that tracks retry attempts for testing
+#[derive(Clone)]
+struct InstrumentedKinesisRetryLogic {
+    inner: KinesisRetryLogic,
+    retry_count: Arc<AtomicUsize>,
+    partial_retry_count: Arc<AtomicUsize>,
+    error_retry_count: Arc<AtomicUsize>,
+}
+
+impl InstrumentedKinesisRetryLogic {
+    fn new(retry_partial: bool) -> Self {
+        Self {
+            inner: KinesisRetryLogic { retry_partial },
+            retry_count: Arc::new(AtomicUsize::new(0)),
+            partial_retry_count: Arc::new(AtomicUsize::new(0)),
+            error_retry_count: Arc::new(AtomicUsize::new(0)),
+        }
     }
+
+    fn total_retries(&self) -> usize {
+        self.retry_count.load(Ordering::Relaxed)
+    }
+
+    fn partial_retries(&self) -> usize {
+        self.partial_retry_count.load(Ordering::Relaxed)
+    }
+
+    fn error_retries(&self) -> usize {
+        self.error_retry_count.load(Ordering::Relaxed)
+    }
+
+    fn retry_counts(&self) -> RetryStats {
+        RetryStats {
+            total: self.total_retries(),
+            partial: self.partial_retries(),
+            error: self.error_retries(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RetryStats {
+    total: usize,
+    partial: usize,
+    error: usize,
+}
+
+impl RetryLogic for InstrumentedKinesisRetryLogic {
+    type Error = SdkError<KinesisError, HttpResponse>;
+    type Request = BatchKinesisRequest<KinesisStreamRecord>;
+    type Response = KinesisResponse;
+
+    fn is_retriable_error(&self, error: &Self::Error) -> bool {
+        let is_retriable = self.inner.is_retriable_error(error);
+        if is_retriable {
+            self.retry_count.fetch_add(1, Ordering::Relaxed);
+            self.error_retry_count.fetch_add(1, Ordering::Relaxed);
+        }
+        is_retriable
+    }
+
+    fn should_retry_response(&self, response: &Self::Response) -> RetryAction<Self::Request> {
+        let action = self.inner.should_retry_response(response);
+
+        match &action {
+            RetryAction::RetryPartial(_) => {
+                self.retry_count.fetch_add(1, Ordering::Relaxed);
+                self.partial_retry_count.fetch_add(1, Ordering::Relaxed);
+            }
+            RetryAction::Retry(_) => {
+                self.retry_count.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+
+        action
+    }
+
+    fn on_retriable_error(&self, error: &Self::Error) {
+        self.inner.on_retriable_error(error);
+    }
+}
+
+impl Default for InstrumentedKinesisRetryLogic {
+    fn default() -> Self {
+        Self::new(false)
+    }
+}
+
+/// Helper function to build a test sink with instrumented retry logic
+async fn build_test_sink_with_retry_counter(
+    config: &KinesisSinkBaseConfig,
+    batch: BatchConfig<KinesisDefaultBatchSettings>,
+) -> crate::Result<(VectorSink, Arc<InstrumentedKinesisRetryLogic>)> {
+    let client = client().await;
+
+    let batch_settings = batch
+        .validate()?
+        .limit_max_bytes(MAX_PAYLOAD_SIZE)?
+        .limit_max_events(MAX_PAYLOAD_EVENTS)?
+        .into_batcher_settings()?;
+
+    let instrumented_retry_logic = Arc::new(InstrumentedKinesisRetryLogic::new(
+        config.request_retry_partial,
+    ));
+    let retry_logic_clone = Arc::clone(&instrumented_retry_logic);
+
+    let sink = build_sink::<
+        KinesisStreamClient,
+        KinesisRecord,
+        KinesisStreamRecord,
+        KinesisError,
+        InstrumentedKinesisRetryLogic,
+    >(
+        config,
+        config.partition_key_field.clone(),
+        batch_settings,
+        KinesisStreamClient { client },
+        (*retry_logic_clone).clone(),
+    )?;
+
+    Ok((sink, instrumented_retry_logic))
 }
 
 #[tokio::test]
@@ -225,8 +358,6 @@ fn gen_stream() -> String {
 
 #[tokio::test]
 async fn kinesis_retry_failed_records_on_partial_failure() {
-    setup_localstack_for_partial_failures();
-
     let stream = gen_stream();
 
     ensure_stream(stream.clone()).await;
@@ -270,11 +401,10 @@ async fn kinesis_retry_failed_records_on_partial_failure() {
         partition_key_field: Some(ConfigValuePath::try_from("partition_key".to_string()).unwrap()),
     };
 
-    let config = KinesisStreamsSinkConfig { batch, base };
-
-    let cx = SinkContext::default();
-
-    let sink = config.build(cx).await.unwrap().0;
+    // Build sink with instrumented retry logic
+    let (sink, retry_counter) = build_test_sink_with_retry_counter(&base, batch)
+        .await
+        .expect("Failed to build test sink");
 
     let timestamp = chrono::Utc::now().timestamp_millis();
 
@@ -295,9 +425,41 @@ async fn kinesis_retry_failed_records_on_partial_failure() {
     // Send events through the sink
     run_and_assert_sink_compliance(sink, events, &AWS_SINK_TAGS).await;
 
-    // Wait for localstack to process all records including retries
-    sleep(Duration::from_secs(3)).await;
+    // Wait for retries to occur and processing to complete using condition-based polling
+    let retry_counter_clone = Arc::clone(&retry_counter);
+    crate::test_util::wait_for_duration(
+        move || {
+            let retry_counter = Arc::clone(&retry_counter_clone);
+            async move {
+                let stats = retry_counter.retry_counts();
+                // We expect partial retries to occur due to throttling
+                stats.partial > 0 || stats.total > 0
+            }
+        },
+        Duration::from_secs(30),
+    )
+    .await;
 
+    // Assert that retries actually occurred
+    let final_stats = retry_counter.retry_counts();
+    println!("Retry statistics: {:?}", final_stats);
+
+    assert!(
+        final_stats.total > 0,
+        "Expected at least one retry attempt, but got {}. Partial: {}, Error: {}",
+        final_stats.total,
+        final_stats.partial,
+        final_stats.error
+    );
+
+    assert!(
+        final_stats.partial > 0,
+        "Expected partial retries due to throttling, but got {}. Total: {}",
+        final_stats.partial,
+        final_stats.total
+    );
+
+    // Now fetch records and verify all were eventually delivered
     let records = fetch_records(stream, timestamp).await.unwrap();
 
     let mut output_lines = records
@@ -313,11 +475,13 @@ async fn kinesis_retry_failed_records_on_partial_failure() {
     assert_eq!(
         output_lines.len(),
         input_lines.len(),
-        "All records should be delivered when retry_partial is enabled"
+        "All records should be delivered when retry_partial is enabled. Retries: {:?}",
+        final_stats
     );
     assert_eq!(
         output_lines, input_lines,
-        "Output should match input when retry_partial handles failed records"
+        "Output should match input when retry_partial handles failed records. Retries: {:?}",
+        final_stats
     );
 }
 

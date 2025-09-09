@@ -165,8 +165,8 @@ impl GenerateConfig for KinesisStreamsSinkConfig {
     }
 }
 #[derive(Default, Clone)]
-struct KinesisRetryLogic {
-    retry_partial: bool,
+pub struct KinesisRetryLogic {
+    pub retry_partial: bool,
 }
 
 impl RetryLogic for KinesisRetryLogic {
