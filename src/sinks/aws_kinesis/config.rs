@@ -69,6 +69,27 @@ pub struct KinesisSinkBaseConfig {
     /// If not specified, a unique partition key is generated for each Kinesis record.
     #[configurable(metadata(docs::examples = "user_id"))]
     pub partition_key_field: Option<ConfigValuePath>,
+
+    /// Enable KPL (Kinesis Producer Library) style aggregation.
+    ///
+    /// When enabled, multiple user records are packed into single Kinesis records
+    /// to improve throughput and reduce API calls. Records with the same partition
+    /// key will be aggregated together up to the specified limits.
+    #[serde(default)]
+    #[configurable(metadata(docs::advanced))]
+    pub enable_aggregation: bool,
+
+    /// Maximum number of user records to aggregate into a single Kinesis record.
+    ///
+    /// Higher values improve throughput but increase latency and retry payload size.
+    /// Must be between 1 and 1000. Only used when `enable_aggregation` is true.
+    #[serde(default = "default_max_records_per_aggregate")]
+    #[configurable(metadata(docs::advanced))]
+    pub max_records_per_aggregate: usize,
+}
+
+fn default_max_records_per_aggregate() -> usize {
+    100
 }
 
 impl KinesisSinkBaseConfig {
@@ -78,6 +99,15 @@ impl KinesisSinkBaseConfig {
 
     pub const fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
+    }
+
+    pub fn validate_aggregation_config(&self) -> crate::Result<()> {
+        if self.enable_aggregation {
+            if self.max_records_per_aggregate == 0 || self.max_records_per_aggregate > 1000 {
+                return Err("max_records_per_aggregate must be between 1 and 1000".into());
+            }
+        }
+        Ok(())
     }
 }
 
