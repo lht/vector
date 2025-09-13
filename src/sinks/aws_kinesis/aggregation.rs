@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use bytes::{Bytes, BytesMut, BufMut};
 use md5::{Md5, Digest};
 use crate::event::{EventFinalizers, Finalizable};
-use vector_lib::request_metadata::RequestMetadata;
+use vector_lib::{request_metadata::RequestMetadata, ByteSizeOf};
 
 // KPL Magic bytes - identifies this as a KPL aggregated record
 const KPL_MAGIC: [u8; 4] = [0xF3, 0x89, 0x9A, 0xC2];
@@ -62,6 +62,17 @@ impl Finalizable for UserRecord {
     }
 }
 
+impl ByteSizeOf for UserRecord {
+    fn size_of(&self) -> usize {
+        self.encoded_size()
+    }
+
+    fn allocated_bytes(&self) -> usize {
+        self.data.len() + self.partition_key.len() + 
+        self.explicit_hash_key.as_ref().map_or(0, |k| k.len())
+    }
+}
+
 /// Aggregated record containing multiple user records
 #[derive(Debug, Clone)]
 pub struct AggregatedRecord {
@@ -84,6 +95,7 @@ impl Finalizable for AggregatedRecord {
 }
 
 /// KPL aggregator that packs multiple user records into aggregated records
+#[derive(Clone)]
 pub struct KplAggregator {
     max_records_per_aggregate: usize,
     max_aggregate_size: usize,

@@ -59,6 +59,7 @@ impl Record for KinesisStreamRecord {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)] // Reserved for future aggregated record handling
 pub struct KinesisAggregatedStreamRecord {
     pub record: KinesisRecord,
     pub user_record_count: usize,
@@ -67,7 +68,7 @@ pub struct KinesisAggregatedStreamRecord {
 impl Record for KinesisAggregatedStreamRecord {
     type T = KinesisRecord;
 
-    fn new(payload_bytes: &Bytes, partition_key: &str) -> Self {
+    fn new(_payload_bytes: &Bytes, _partition_key: &str) -> Self {
         // This shouldn't be called for aggregated records, use from_aggregated instead
         panic!("Use from_aggregated for aggregated records, not new")
     }
