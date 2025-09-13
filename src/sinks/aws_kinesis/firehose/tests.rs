@@ -36,6 +36,8 @@ async fn check_batch_size() {
         request_retry_partial: false,
         acknowledgements: Default::default(),
         partition_key_field: None,
+        enable_aggregation: false,
+        max_records_per_aggregate: 100,
     };
 
     let config = KinesisFirehoseSinkConfig { batch, base };
@@ -67,6 +69,8 @@ async fn check_batch_events() {
         request_retry_partial: false,
         acknowledgements: Default::default(),
         partition_key_field: None,
+        enable_aggregation: false,
+        max_records_per_aggregate: 100,
     };
 
     let config = KinesisFirehoseSinkConfig { batch, base };
