@@ -33,6 +33,15 @@ impl Record for KinesisFirehoseRecord {
     fn get(self) -> Self::T {
         self.record
     }
+
+    fn from_aggregated(aggregated: &super::super::aggregation::AggregatedRecord) -> Self {
+        Self {
+            record: KinesisRecord::builder()
+                .data(Blob::new(&aggregated.data[..]))
+                .build()
+                .expect("all builder records specified"),
+        }
+    }
 }
 
 #[derive(Clone)]

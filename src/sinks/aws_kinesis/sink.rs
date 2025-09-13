@@ -7,7 +7,7 @@ use vrl::path::PathPrefix;
 use super::{
     record::Record,
     request_builder::{KinesisRequest, KinesisRequestBuilder, KinesisAggregationRequestBuilder, KinesisUserRequest},
-    aggregation::{KplAggregator, AggregatedRecord},
+    aggregation::KplAggregator,
 };
 use crate::{
     internal_events::{AwsKinesisStreamNoPartitionKeyError, SinkRequestBuildError},
@@ -44,12 +44,15 @@ where
     R: Record + Send + Sync + Unpin + Clone + 'static,
 {
     async fn run_inner(self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {
-        if let Some(aggregator) = self.aggregator {
-            // Aggregated pipeline
-            self.run_aggregated_pipeline(input, aggregator).await
-        } else {
-            // Current non-aggregated pipeline (unchanged)
-            self.run_standard_pipeline(input).await
+        match self.aggregator.clone() {
+            Some(aggregator) => {
+                // Aggregated pipeline
+                self.run_aggregated_pipeline(input, aggregator).await
+            }
+            None => {
+                // Current non-aggregated pipeline (unchanged)
+                self.run_standard_pipeline(input).await
+            }
         }
     }
     
@@ -80,11 +83,15 @@ where
                         emit!(SinkRequestBuildError { error });
                         None
                     }
-                    Ok(req) => Some(req.user_record),
+                    Ok(req) => Some(req),
                 }
             })
             .batched(batch_settings.as_byte_size_config())
-            .map(move |user_records| {
+            .map(move |user_requests: Vec<KinesisUserRequest>| {
+                // Extract user records from requests
+                let user_records: Vec<_> = user_requests.into_iter()
+                    .map(|req| req.user_record)
+                    .collect();
                 // Apply aggregation
                 let aggregated_records = aggregator.aggregate_records(user_records);
                 
@@ -93,14 +100,14 @@ where
                     .into_iter()
                     .map(|agg_record| {
                         let kinesis_record = R::from_aggregated(&agg_record);
-                        KinesisRequest {
-                            key: KinesisKey {
+                        KinesisRequest::new(
+                            KinesisKey {
                                 partition_key: agg_record.partition_key.clone(),
                             },
-                            record: kinesis_record,
-                            finalizers: agg_record.finalizers,
-                            metadata: agg_record.metadata,
-                        }
+                            kinesis_record,
+                            agg_record.finalizers,
+                            agg_record.metadata,
+                        )
                     })
                     .collect::<Vec<_>>();
                 
