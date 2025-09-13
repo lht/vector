@@ -81,6 +81,25 @@ where
     }
 }
 
+impl<R> KinesisRequest<R>
+where
+    R: Record,
+{
+    pub fn new(
+        key: KinesisKey,
+        record: R,
+        finalizers: EventFinalizers,
+        metadata: RequestMetadata,
+    ) -> Self {
+        Self {
+            key,
+            record,
+            finalizers,
+            metadata,
+        }
+    }
+}
+
 impl<R> RequestBuilder<KinesisProcessedEvent> for KinesisRequestBuilder<R>
 where
     R: Record,
