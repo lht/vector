@@ -39,7 +39,7 @@ where
     pub key: KinesisKey,
     pub record: R,
     pub finalizers: EventFinalizers,
-    metadata: RequestMetadata,
+    pub metadata: RequestMetadata,
 }
 
 impl<R> Finalizable for KinesisRequest<R>

@@ -48,6 +48,18 @@ impl Record for KinesisStreamRecord {
     }
 }
 
+impl KinesisStreamRecord {
+    pub fn from_aggregated(aggregated: &super::aggregation::AggregatedRecord) -> Self {
+        Self {
+            record: KinesisRecord::builder()
+                .data(Blob::new(&aggregated.data[..]))
+                .partition_key(&aggregated.partition_key)
+                .build()
+                .expect("all required builder fields set"),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct KinesisStreamClient {
     pub client: KinesisClient,
