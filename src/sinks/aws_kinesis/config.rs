@@ -5,8 +5,9 @@ use vector_lib::{lookup::lookup_v2::ConfigValuePath, stream::BatcherSettings};
 use super::{
     KinesisResponse, KinesisService,
     record::{Record, SendRecord},
-    request_builder::KinesisRequestBuilder,
+    request_builder::{KinesisRequestBuilder, KinesisAggregationRequestBuilder},
     sink::{BatchKinesisRequest, KinesisSink},
+    aggregation::KplAggregator,
 };
 use crate::{
     aws::{AwsAuthentication, RegionOrEndpoint},
@@ -129,9 +130,12 @@ where
     E: Send + 'static,
     RT: RetryLogic<Request = BatchKinesisRequest<RR>, Response = KinesisResponse> + Default,
 {
+    // Validate aggregation config
+    config.validate_aggregation_config()?;
+    
     let request_limits = config.request.into_settings();
-
     let region = config.region.region();
+    
     let service = ServiceBuilder::new()
         .settings::<RT, BatchKinesisRequest<RR>>(request_limits, retry_logic)
         .service(KinesisService::<C, R, E> {
@@ -146,6 +150,20 @@ where
     let serializer = config.encoding.build()?;
     let encoder = Encoder::<()>::new(serializer);
 
+    let (aggregator, aggregation_request_builder) = if config.enable_aggregation {
+        let aggregator = Some(KplAggregator::new(config.max_records_per_aggregate));
+        let agg_builder = Some(KinesisAggregationRequestBuilder::<RR> {
+            compression: config.compression,
+            encoder: (transformer.clone(), encoder.clone()),
+            enable_aggregation: true,
+            _phantom: PhantomData,
+        });
+        (aggregator, agg_builder)
+    } else {
+        (None, None)
+    };
+
+    // Standard request builder for backward compatibility
     let request_builder = KinesisRequestBuilder::<RR> {
         compression: config.compression,
         encoder: (transformer, encoder),
@@ -156,7 +174,9 @@ where
         batch_settings,
         service,
         request_builder,
+        aggregation_request_builder,
         partition_key_field,
+        aggregator,
         _phantom: PhantomData,
     };
     Ok(VectorSink::from_event_streamsink(sink))
