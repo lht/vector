@@ -41,21 +41,19 @@ where
     R: Record + Send + Sync + Unpin + Clone + 'static,
 {
     pub async fn run_inner(self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {
-        // Standard pipeline only (aggregation handled by StreamsKinesisSink)
         let batch_settings = self.batch_settings;
-        let request_builder = self.request_builder;
-        let service = self.service;
-        let partition_key_field = self.partition_key_field;
 
         input
             .filter_map(move |event| {
+                // Panic: This sink only accepts Logs, so this should never panic
                 let log = event.into_log();
-                let processed = process_log(log, partition_key_field.as_ref());
+                let processed = process_log(log, self.partition_key_field.as_ref());
+
                 future::ready(processed)
             })
             .request_builder(
                 default_request_builder_concurrency_limit(),
-                request_builder,
+                self.request_builder,
             )
             .filter_map(|request| async move {
                 match request {
@@ -77,7 +75,7 @@ where
                 );
                 BatchKinesisRequest { events, metadata }
             })
-            .into_driver(service)
+            .into_driver(self.service)
             .run()
             .await
     }

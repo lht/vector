@@ -16,12 +16,12 @@ use crate::{
 
 /// Kinesis Streams-specific sink that supports KPL aggregation
 #[derive(Clone)]
-pub struct StreamsKinesisSink<S, R> {
+pub struct KinesisStreamsSink<S, R> {
     pub base_sink: KinesisSink<S, R>,
     pub aggregator: Option<KplAggregator>,
 }
 
-impl<S, R> StreamsKinesisSink<S, R>
+impl<S, R> KinesisStreamsSink<S, R>
 where
     S: Service<BatchKinesisRequest<R>> + Send + 'static,
     S::Future: Send + 'static,
@@ -113,7 +113,7 @@ where
 }
 
 #[async_trait]
-impl<S, R> StreamSink<Event> for StreamsKinesisSink<S, R>
+impl<S, R> StreamSink<Event> for KinesisStreamsSink<S, R>
 where
     S: Service<BatchKinesisRequest<R>> + Send + 'static,
     S::Future: Send + 'static,
