@@ -1,4 +1,4 @@
-use std::{fmt::Debug, num::NonZeroUsize};
+use std::fmt::Debug;
 
 use super::{aggregation::{KplAggregator, UserRecord}, record::KinesisStreamRecord};
 use super::super::sink::{KinesisSink, BatchKinesisRequest, KinesisKey, process_log};
@@ -56,7 +56,7 @@ where
                 future::ready(processed)
             })
             .request_builder(
-                NonZeroUsize::new(50).unwrap(),
+                default_request_builder_concurrency_limit(),
                 request_builder,
             )
             .filter_map(|request| async move {
