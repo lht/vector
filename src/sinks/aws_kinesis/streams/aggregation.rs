@@ -6,7 +6,7 @@ use vector_lib::{request_metadata::RequestMetadata, ByteSizeOf};
 
 // KPL Magic bytes - identifies this as a KPL aggregated record
 const KPL_MAGIC: [u8; 4] = [0xF3, 0x89, 0x9A, 0xC2];
-const MAX_AGGREGATE_SIZE: usize = 900_000; // 900KB to stay under 1MB limit
+const MAX_AGGREGATE_SIZE: usize = 675_000; // 675KB binary data = 900KB Base64 < 1MB JSON limit
 
 /// Individual user record before aggregation
 #[derive(Debug, Clone)]
@@ -24,10 +24,14 @@ pub struct UserRecord {
 }
 
 impl UserRecord {
-    /// Calculate the encoded size of this record in KPL format
+    /// Calculate the encoded size of this record in KPL format (binary protobuf-like).
+    /// 
+    /// Note: This calculates the size for the internal KPL binary format, NOT the final
+    /// JSON wire format. The actual JSON sent to AWS will be ~33% larger due to Base64
+    /// encoding of the binary data.
     pub fn encoded_size(&self) -> usize {
         4 + // data length (u32)
-        self.data.len() + // data
+        self.data.len() + // data (binary, will be Base64 encoded at JSON layer)
         1 + // partition key length (u8)
         self.partition_key.len() + // partition key
         1 + // explicit hash key length (u8) - always present, 0 if None
@@ -304,8 +308,8 @@ mod tests {
     fn test_oversized_record_safety_check() {
         let aggregator = KplAggregator::new(100);
 
-        // Create a record that's too large (> 900KB)
-        let large_data = vec![0u8; 950_000]; // 950KB data
+        // Create a record that's too large (> 675KB limit)
+        let large_data = vec![0u8; 700_000]; // 700KB data (exceeds 675KB limit)
         let user_records = vec![
             UserRecord {
                 data: Bytes::from("normal record"),
