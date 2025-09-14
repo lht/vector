@@ -30,8 +30,8 @@ impl UserRecord {
         self.data.len() + // data
         1 + // partition key length (u8)
         self.partition_key.len() + // partition key
-        1 + // explicit hash key length (u8)
-        self.explicit_hash_key.as_ref().map_or(0, |k| k.len()) // explicit hash key
+        1 + // explicit hash key length (u8) - always present, 0 if None
+        self.explicit_hash_key.as_ref().map_or(0, |k| k.len()) // explicit hash key data (if any)
     }
 
     /// Encode this record into the KPL format
@@ -124,6 +124,17 @@ impl KplAggregator {
 
         for user_record in user_records {
             let record_size = user_record.encoded_size();
+
+            // Safety check: Skip records that are too large for any aggregate
+            if record_size > self.max_aggregate_size {
+                eprintln!(
+                    "Warning: Skipping user record that is too large for aggregation. \
+                     Record size: {} bytes, limit: {} bytes. \
+                     Consider reducing compression ratio or disabling aggregation for large records.",
+                    record_size, self.max_aggregate_size
+                );
+                continue;
+            }
 
             // Check if we should start a new aggregate
             let should_flush = current_batch.len() >= self.max_records_per_aggregate
@@ -287,5 +298,45 @@ mod tests {
         assert_eq!(aggregated.len(), 1);
         assert_eq!(aggregated[0].user_record_count, 2);
         assert_eq!(aggregated[0].partition_key, "key1"); // Uses first record's key
+    }
+
+    #[test]
+    fn test_oversized_record_safety_check() {
+        let aggregator = KplAggregator::new(100);
+
+        // Create a record that's too large (> 900KB)
+        let large_data = vec![0u8; 950_000]; // 950KB data
+        let user_records = vec![
+            UserRecord {
+                data: Bytes::from("normal record"),
+                partition_key: "key1".to_string(),
+                explicit_hash_key: None,
+                finalizers: EventFinalizers::default(),
+                metadata: RequestMetadata::default(),
+            },
+            UserRecord {
+                data: Bytes::from(large_data), // This record is too large
+                partition_key: "key2".to_string(),
+                explicit_hash_key: None,
+                finalizers: EventFinalizers::default(),
+                metadata: RequestMetadata::default(),
+            },
+            UserRecord {
+                data: Bytes::from("another normal record"),
+                partition_key: "key3".to_string(),
+                explicit_hash_key: None,
+                finalizers: EventFinalizers::default(),
+                metadata: RequestMetadata::default(),
+            },
+        ];
+
+        let aggregated = aggregator.aggregate_records(user_records);
+        
+        // Should create one aggregate with only the normal records (large record skipped)
+        assert_eq!(aggregated.len(), 1);
+        assert_eq!(aggregated[0].user_record_count, 2); // Only 2 records (large one skipped)
+        
+        // Verify the aggregated record is under the size limit
+        assert!(aggregated[0].data.len() < 1_000_000); // Under 1MB
     }
 }
