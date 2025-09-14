@@ -2,6 +2,7 @@ pub mod aggregation;
 mod config;
 mod integration_tests;
 mod record;
+mod sink;
 
 use aws_sdk_kinesis::{
     Client, operation::put_records::PutRecordsError, types::PutRecordsRequestEntry,
@@ -13,7 +14,7 @@ pub use super::{
     record::{Record, SendRecord},
     request_builder,
     service::{KinesisResponse, KinesisService},
-    sink,
+    sink as base_sink,
 };
 
 pub type KinesisError = PutRecordsError;

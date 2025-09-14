@@ -6,11 +6,8 @@ use vrl::path::PathPrefix;
 
 use super::{
     record::Record,
-    request_builder::{KinesisRequest, KinesisRequestBuilder, KinesisBuilderOutput, KinesisUserRequest},
+    request_builder::{KinesisRequest, KinesisRequestBuilder, KinesisBuilderOutput},
 };
-
-#[cfg(feature = "sinks-aws_kinesis_streams")]
-use super::streams::aggregation::KplAggregator;
 use crate::{
     internal_events::{AwsKinesisStreamNoPartitionKeyError, SinkRequestBuildError},
     sinks::{
@@ -32,7 +29,6 @@ pub struct KinesisSink<S, R> {
     pub service: S,
     pub request_builder: KinesisRequestBuilder<R>,
     pub partition_key_field: Option<ConfigValuePath>,
-    pub aggregator: Option<KplAggregator>,
     pub _phantom: PhantomData<R>,
 }
 
@@ -44,92 +40,8 @@ where
     S::Error: Debug + Into<crate::Error> + Send,
     R: Record + Send + Sync + Unpin + Clone + 'static,
 {
-    async fn run_inner(self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {
-        match self.aggregator.clone() {
-            Some(aggregator) => {
-                // Aggregated pipeline
-                self.run_aggregated_pipeline(input, aggregator).await
-            }
-            None => {
-                // non-aggregated pipeline
-                self.run_standard_pipeline(input).await
-            }
-        }
-    }
-
-    async fn run_aggregated_pipeline(
-        self: Box<Self>,
-        input: BoxStream<'_, Event>,
-        aggregator: KplAggregator,
-    ) -> Result<(), ()> {
-        let batch_settings = self.batch_settings;
-        let request_builder = self.request_builder;
-        let service = self.service;
-        let partition_key_field = self.partition_key_field;
-
-        input
-            .filter_map(move |event| {
-                let log = event.into_log();
-                let processed = process_log(log, partition_key_field.as_ref());
-                future::ready(processed)
-            })
-            .request_builder(
-                default_request_builder_concurrency_limit(),
-                request_builder,
-            )
-            .filter_map(|request| async move {
-                match request {
-                    Err(error) => {
-                        emit!(SinkRequestBuildError { error });
-                        None
-                    }
-                    Ok(KinesisBuilderOutput::Aggregation(req)) => Some(req),
-                    Ok(KinesisBuilderOutput::Standard(_)) => {
-                        // This shouldn't happen in aggregation mode
-                        None
-                    }
-                }
-            })
-            .batched(batch_settings.as_byte_size_config())
-            .map(move |user_requests: Vec<KinesisUserRequest>| {
-                // Extract user records from requests
-                let user_records: Vec<_> = user_requests.into_iter()
-                    .map(|req| req.user_record)
-                    .collect();
-                // Apply aggregation
-                let aggregated_records = aggregator.aggregate_records(user_records);
-
-                // Convert to batch request
-                let events = aggregated_records
-                    .into_iter()
-                    .map(|agg_record| {
-                        let kinesis_record = R::from_aggregated(&agg_record);
-                        KinesisRequest::new(
-                            KinesisKey {
-                                partition_key: agg_record.partition_key.clone(),
-                            },
-                            kinesis_record,
-                            agg_record.finalizers,
-                            agg_record.metadata,
-                        )
-                    })
-                    .collect::<Vec<_>>();
-
-                let metadata = RequestMetadata::from_batch(
-                    events.iter().map(|req| req.get_metadata().clone())
-                );
-
-                BatchKinesisRequest { events, metadata }
-            })
-            .into_driver(service)
-            .run()
-            .await
-    }
-
-    async fn run_standard_pipeline(
-        self: Box<Self>,
-        input: BoxStream<'_, Event>,
-    ) -> Result<(), ()> {
+    pub async fn run_inner(self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {
+        // Standard pipeline only (aggregation handled by StreamsKinesisSink)
         let batch_settings = self.batch_settings;
         let request_builder = self.request_builder;
         let service = self.service;
