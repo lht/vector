@@ -1,8 +1,7 @@
 use std::fmt::Debug;
 
-use super::aggregation::KplAggregator;
+use super::{aggregation::KplAggregator, record::KinesisStreamRecord};
 use super::super::{
-    record::Record,
     request_builder::{KinesisRequest, KinesisBuilderOutput, KinesisUserRequest},
     sink::{KinesisSink, BatchKinesisRequest, KinesisKey, process_log},
 };
@@ -16,18 +15,17 @@ use crate::{
 
 /// Kinesis Streams-specific sink that supports KPL aggregation
 #[derive(Clone)]
-pub struct KinesisStreamsSink<S, R> {
-    pub base_sink: KinesisSink<S, R>,
+pub struct KinesisStreamsSink<S> {
+    pub base_sink: KinesisSink<S, KinesisStreamRecord>,
     pub aggregator: Option<KplAggregator>,
 }
 
-impl<S, R> KinesisStreamsSink<S, R>
+impl<S> KinesisStreamsSink<S>
 where
-    S: Service<BatchKinesisRequest<R>> + Send + 'static,
+    S: Service<BatchKinesisRequest<KinesisStreamRecord>> + Send + 'static,
     S::Future: Send + 'static,
     S::Response: DriverResponse + Send + 'static,
     S::Error: Debug + Into<crate::Error> + Send,
-    R: Record + Send + Sync + Unpin + Clone + 'static,
 {
     async fn run_inner(self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {
         match self.aggregator.clone() {
@@ -88,7 +86,7 @@ where
                 let events = aggregated_records
                     .into_iter()
                     .map(|agg_record| {
-                        let kinesis_record = R::from_aggregated(&agg_record);
+                        let kinesis_record = KinesisStreamRecord::from_aggregated(&agg_record);
                         KinesisRequest::new(
                             KinesisKey {
                                 partition_key: agg_record.partition_key.clone(),
@@ -113,13 +111,12 @@ where
 }
 
 #[async_trait]
-impl<S, R> StreamSink<Event> for KinesisStreamsSink<S, R>
+impl<S> StreamSink<Event> for KinesisStreamsSink<S>
 where
-    S: Service<BatchKinesisRequest<R>> + Send + 'static,
+    S: Service<BatchKinesisRequest<KinesisStreamRecord>> + Send + 'static,
     S::Future: Send + 'static,
     S::Response: DriverResponse + Send + 'static,
     S::Error: Debug + Into<crate::Error> + Send,
-    R: Record + Send + Sync + Unpin + Clone + 'static,
 {
     async fn run(self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {
         self.run_inner(input).await
