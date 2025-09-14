@@ -23,10 +23,10 @@ where
     S::Error: Debug + Into<crate::Error> + Send,
 {
     async fn run_inner(self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {
-        match self.aggregator.clone() {
-            Some(aggregator) => {
+        match self.aggregator {
+            Some(_) => {
                 // Aggregated pipeline
-                self.run_aggregated_pipeline(input, aggregator).await
+                self.run_aggregated_pipeline(input).await
             }
             None => {
                 // Standard pipeline - use base sink logic directly
@@ -38,9 +38,9 @@ where
     async fn run_aggregated_pipeline(
         self: Box<Self>,
         input: BoxStream<'_, Event>,
-        aggregator: KplAggregator,
     ) -> Result<(), ()> {
-        let Self { base_sink, .. } = *self;
+        let Self { base_sink, aggregator, .. } = *self;
+        let aggregator = aggregator.expect("aggregator must be Some when calling run_aggregated_pipeline");
         let KinesisSink {
             batch_settings,
             service,
