@@ -13,7 +13,7 @@ use super::{
     request_builder::KinesisRequestBuilder,
 };
 use super::aggregation::KplAggregator;
-use super::sink::StreamsKinesisSink;
+use super::sink::KinesisStreamsSink;
 use crate::{
     aws::{ClientBuilder, create_client, is_retriable_error},
     config::{AcknowledgementsConfig, Input, ProxyConfig, SinkConfig, SinkContext},
@@ -214,7 +214,7 @@ impl SinkConfig for KinesisStreamsSinkConfig {
             _phantom: PhantomData,
         };
 
-        let streams_sink = StreamsKinesisSink {
+        let streams_sink = KinesisStreamsSink {
             base_sink,
             aggregator,
         };
