@@ -4,7 +4,6 @@ pub mod streams;
 #[cfg(feature = "sinks-aws_kinesis_firehose")]
 pub mod firehose;
 
-pub mod aggregation;
 pub mod config;
 pub mod record;
 pub mod request_builder;

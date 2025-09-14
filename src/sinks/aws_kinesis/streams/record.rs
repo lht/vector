@@ -47,7 +47,7 @@ impl Record for KinesisStreamRecord {
         self.record
     }
 
-    fn from_aggregated(aggregated: &super::super::aggregation::AggregatedRecord) -> Self {
+    fn from_aggregated(aggregated: &super::aggregation::AggregatedRecord) -> Self {
         Self {
             record: KinesisRecord::builder()
                 .data(Blob::new(&aggregated.data[..]))
@@ -73,7 +73,7 @@ impl Record for KinesisAggregatedStreamRecord {
         panic!("Use from_aggregated for aggregated records, not new")
     }
 
-    fn from_aggregated(aggregated: &super::super::aggregation::AggregatedRecord) -> Self {
+    fn from_aggregated(aggregated: &super::aggregation::AggregatedRecord) -> Self {
         Self {
             record: KinesisRecord::builder()
                 .data(Blob::new(&aggregated.data[..]))

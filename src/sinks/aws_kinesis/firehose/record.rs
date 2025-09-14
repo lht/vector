@@ -34,7 +34,7 @@ impl Record for KinesisFirehoseRecord {
         self.record
     }
 
-    fn from_aggregated(_aggregated: &super::super::aggregation::AggregatedRecord) -> Self {
+    fn from_aggregated(_aggregated: &super::super::streams::aggregation::AggregatedRecord) -> Self {
         // This should never be called since Firehose doesn't support aggregation
         unreachable!("KPL aggregation is not supported by Kinesis Data Firehose")
     }

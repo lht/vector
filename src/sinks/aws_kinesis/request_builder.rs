@@ -9,8 +9,10 @@ use vector_lib::{
 use super::{
     record::Record,
     sink::{KinesisKey, KinesisProcessedEvent},
-    aggregation::UserRecord,
 };
+
+#[cfg(feature = "sinks-aws_kinesis_streams")]
+use super::streams::aggregation::UserRecord;
 use crate::{
     codecs::{Encoder, Transformer},
     event::{Event, EventFinalizers, Finalizable},

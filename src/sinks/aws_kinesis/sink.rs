@@ -7,8 +7,10 @@ use vrl::path::PathPrefix;
 use super::{
     record::Record,
     request_builder::{KinesisRequest, KinesisRequestBuilder, KinesisBuilderOutput, KinesisUserRequest},
-    aggregation::KplAggregator,
 };
+
+#[cfg(feature = "sinks-aws_kinesis_streams")]
+use super::streams::aggregation::KplAggregator;
 use crate::{
     internal_events::{AwsKinesisStreamNoPartitionKeyError, SinkRequestBuildError},
     sinks::{

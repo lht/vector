@@ -12,7 +12,7 @@ use super::{
     sink::{BatchKinesisRequest, KinesisSink},
     request_builder::KinesisRequestBuilder,
 };
-use crate::sinks::aws_kinesis::aggregation::KplAggregator;
+use super::aggregation::KplAggregator;
 use crate::{
     aws::{ClientBuilder, create_client, is_retriable_error},
     config::{AcknowledgementsConfig, Input, ProxyConfig, SinkConfig, SinkContext},

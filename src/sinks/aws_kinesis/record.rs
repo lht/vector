@@ -3,7 +3,10 @@ use std::future::Future;
 use aws_smithy_runtime_api::client::{orchestrator::HttpResponse, result::SdkError};
 use bytes::Bytes;
 
-use super::{KinesisResponse, aggregation::AggregatedRecord};
+use super::KinesisResponse;
+
+#[cfg(feature = "sinks-aws_kinesis_streams")]
+use super::streams::aggregation::AggregatedRecord;
 /// An AWS Kinesis record type primarily to store the underlying aws crates' actual record `T`, and
 /// to abstract the encoded length calculation.
 pub trait Record {
