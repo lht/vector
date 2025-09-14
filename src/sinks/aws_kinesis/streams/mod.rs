@@ -1,3 +1,4 @@
+pub mod aggregation;
 mod config;
 mod integration_tests;
 mod record;
