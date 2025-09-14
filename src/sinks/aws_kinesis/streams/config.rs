@@ -7,10 +7,12 @@ use snafu::Snafu;
 use vector_lib::configurable::{component::GenerateConfig, configurable_component};
 
 use super::{
-    KinesisClient, KinesisError, KinesisRecord, KinesisResponse, KinesisSinkBaseConfig, build_sink,
+    KinesisClient, KinesisError, KinesisRecord, KinesisResponse, KinesisSinkBaseConfig,
     record::{KinesisStreamClient, KinesisStreamRecord},
-    sink::BatchKinesisRequest,
+    sink::{BatchKinesisRequest, KinesisSink},
+    request_builder::KinesisRequestBuilder,
 };
+use crate::sinks::aws_kinesis::aggregation::KplAggregator;
 use crate::{
     aws::{ClientBuilder, create_client, is_retriable_error},
     config::{AcknowledgementsConfig, Input, ProxyConfig, SinkConfig, SinkContext},
@@ -20,9 +22,13 @@ use crate::{
         util::{
             BatchConfig, SinkBatchSettings,
             retries::{RetryAction, RetryLogic},
+            service::ServiceBuilderExt,
         },
+        prelude::ServiceBuilder,
     },
+    codecs::Encoder,
 };
+use std::marker::PhantomData;
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Snafu)]
@@ -70,9 +76,41 @@ pub struct KinesisStreamsSinkConfig {
     #[configurable(derived)]
     #[serde(default)]
     pub batch: BatchConfig<KinesisDefaultBatchSettings>,
+
+    /// Enable KPL (Kinesis Producer Library) style aggregation.
+    ///
+    /// When enabled, multiple user records are packed into single Kinesis records
+    /// to improve throughput and reduce API calls. Records are aggregated up to the
+    /// specified limits, with the first record's partition key used for the entire
+    /// aggregate. This may cause records with different partition keys to be routed
+    /// to the same shard.
+    #[serde(default)]
+    #[configurable(metadata(docs::advanced))]
+    pub enable_aggregation: bool,
+
+    /// Maximum number of user records to aggregate into a single Kinesis record.
+    ///
+    /// Higher values improve throughput but increase latency and retry payload size.
+    /// Must be between 1 and 1000. Only used when `enable_aggregation` is true.
+    #[serde(default = "default_max_records_per_aggregate")]
+    #[configurable(metadata(docs::advanced))]
+    pub max_records_per_aggregate: usize,
+}
+
+fn default_max_records_per_aggregate() -> usize {
+    100
 }
 
 impl KinesisStreamsSinkConfig {
+    fn validate_aggregation_config(&self) -> crate::Result<()> {
+        if self.enable_aggregation {
+            if self.max_records_per_aggregate == 0 || self.max_records_per_aggregate > 1000 {
+                return Err("max_records_per_aggregate must be between 1 and 1000".into());
+            }
+        }
+        Ok(())
+    }
+
     async fn healthcheck(self, client: KinesisClient) -> crate::Result<()> {
         let stream_name = self.base.stream_name;
 
@@ -118,6 +156,9 @@ impl KinesisStreamsSinkConfig {
 #[typetag::serde(name = "aws_kinesis_streams")]
 impl SinkConfig for KinesisStreamsSinkConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+        // Validate aggregation config
+        self.validate_aggregation_config()?;
+        
         let client = self.create_client(&cx.proxy).await?;
         let healthcheck = self.clone().healthcheck(client.clone()).boxed();
 
@@ -128,23 +169,52 @@ impl SinkConfig for KinesisStreamsSinkConfig {
             .limit_max_events(MAX_PAYLOAD_EVENTS)?
             .into_batcher_settings()?;
 
-        let sink = build_sink::<
-            KinesisStreamClient,
-            KinesisRecord,
-            KinesisStreamRecord,
-            KinesisError,
-            KinesisRetryLogic,
-        >(
-            &self.base,
-            self.base.partition_key_field.clone(),
-            batch_settings,
-            KinesisStreamClient { client },
-            KinesisRetryLogic {
-                retry_partial: self.base.request_retry_partial,
-            },
-        )?;
+        // Build sink with aggregation support
+        let request_limits = self.base.request.into_settings();
+        let region = self.base.region.region();
+        
+        let service = ServiceBuilder::new()
+            .settings::<KinesisRetryLogic, BatchKinesisRequest<KinesisStreamRecord>>(
+                request_limits, 
+                KinesisRetryLogic {
+                    retry_partial: self.base.request_retry_partial,
+                }
+            )
+            .service(super::KinesisService::<KinesisStreamClient, KinesisRecord, KinesisError> {
+                client: KinesisStreamClient { client },
+                stream_name: self.base.stream_name.clone(),
+                region,
+                _phantom_t: PhantomData,
+                _phantom_e: PhantomData,
+            });
 
-        Ok((sink, healthcheck))
+        let transformer = self.base.encoding.transformer();
+        let serializer = self.base.encoding.build()?;
+        let encoder = Encoder::<()>::new(serializer);
+
+        let aggregator = if self.enable_aggregation {
+            Some(KplAggregator::new(self.max_records_per_aggregate))
+        } else {
+            None
+        };
+
+        let request_builder = KinesisRequestBuilder::<KinesisStreamRecord> {
+            compression: self.base.compression,
+            encoder: (transformer, encoder),
+            aggregation_mode: self.enable_aggregation,
+            _phantom: PhantomData,
+        };
+
+        let sink = KinesisSink {
+            batch_settings,
+            service,
+            request_builder,
+            partition_key_field: self.base.partition_key_field.clone(),
+            aggregator,
+            _phantom: PhantomData,
+        };
+
+        Ok((VectorSink::from_event_streamsink(sink), healthcheck))
     }
 
     fn input(&self) -> Input {
