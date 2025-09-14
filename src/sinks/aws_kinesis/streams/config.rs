@@ -202,7 +202,6 @@ impl SinkConfig for KinesisStreamsSinkConfig {
         let request_builder = KinesisRequestBuilder::<KinesisStreamRecord> {
             compression: self.base.compression,
             encoder: (transformer, encoder),
-            aggregation_mode: self.enable_aggregation,
             _phantom: PhantomData,
         };
 

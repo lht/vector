@@ -6,7 +6,7 @@ use vrl::path::PathPrefix;
 
 use super::{
     record::Record,
-    request_builder::{KinesisRequest, KinesisRequestBuilder, KinesisBuilderOutput},
+    request_builder::{KinesisRequest, KinesisRequestBuilder},
 };
 use crate::{
     internal_events::{AwsKinesisStreamNoPartitionKeyError, SinkRequestBuildError},
@@ -61,11 +61,7 @@ where
                         emit!(SinkRequestBuildError { error });
                         None
                     }
-                    Ok(KinesisBuilderOutput::Standard(req)) => Some(req),
-                    Ok(KinesisBuilderOutput::Aggregation(_)) => {
-                        // This shouldn't happen in standard mode
-                        None
-                    }
+                    Ok(req) => Some(req),
                 }
             })
             .batched(batch_settings.as_byte_size_config())

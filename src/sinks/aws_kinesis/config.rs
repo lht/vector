@@ -122,7 +122,6 @@ where
     let request_builder = KinesisRequestBuilder::<RR> {
         compression: config.compression,
         encoder: (transformer, encoder),
-        aggregation_mode: false,
         _phantom: PhantomData,
     };
 

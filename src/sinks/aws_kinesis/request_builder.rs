@@ -10,9 +10,6 @@ use super::{
     record::Record,
     sink::{KinesisKey, KinesisProcessedEvent},
 };
-
-#[cfg(feature = "sinks-aws_kinesis_streams")]
-use super::streams::aggregation::UserRecord;
 use crate::{
     codecs::{Encoder, Transformer},
     event::{Event, EventFinalizers, Finalizable},
@@ -26,7 +23,6 @@ use crate::{
 pub struct KinesisRequestBuilder<R> {
     pub compression: Compression,
     pub encoder: (Transformer, Encoder<()>),
-    pub aggregation_mode: bool,
     pub _phantom: PhantomData<R>,
 }
 
@@ -35,52 +31,6 @@ pub struct KinesisMetadata {
     pub partition_key: String,
 }
 
-#[derive(Clone)]
-pub enum KinesisBuilderOutput<R: Record> {
-    Standard(KinesisRequest<R>),
-    Aggregation(KinesisUserRequest),
-}
-
-impl<R: Record> Finalizable for KinesisBuilderOutput<R> {
-    fn take_finalizers(&mut self) -> EventFinalizers {
-        match self {
-            KinesisBuilderOutput::Standard(req) => req.take_finalizers(),
-            KinesisBuilderOutput::Aggregation(req) => req.take_finalizers(),
-        }
-    }
-}
-
-impl<R: Record> MetaDescriptive for KinesisBuilderOutput<R> {
-    fn get_metadata(&self) -> &RequestMetadata {
-        match self {
-            KinesisBuilderOutput::Standard(req) => req.get_metadata(),
-            KinesisBuilderOutput::Aggregation(req) => req.get_metadata(),
-        }
-    }
-
-    fn metadata_mut(&mut self) -> &mut RequestMetadata {
-        match self {
-            KinesisBuilderOutput::Standard(req) => req.metadata_mut(),
-            KinesisBuilderOutput::Aggregation(req) => req.metadata_mut(),
-        }
-    }
-}
-
-impl<R: Record> ByteSizeOf for KinesisBuilderOutput<R> {
-    fn size_of(&self) -> usize {
-        match self {
-            KinesisBuilderOutput::Standard(req) => req.size_of(),
-            KinesisBuilderOutput::Aggregation(req) => req.size_of(),
-        }
-    }
-
-    fn allocated_bytes(&self) -> usize {
-        match self {
-            KinesisBuilderOutput::Standard(req) => req.allocated_bytes(),
-            KinesisBuilderOutput::Aggregation(req) => req.allocated_bytes(),
-        }
-    }
-}
 
 #[derive(Clone)]
 pub struct KinesisRequest<R>
@@ -158,7 +108,7 @@ where
     type Events = Event;
     type Encoder = (Transformer, Encoder<()>);
     type Payload = Bytes;
-    type Request = KinesisBuilderOutput<R>;
+    type Request = KinesisRequest<R>;
     type Error = io::Error;
 
     fn compression(&self) -> Compression {
@@ -190,62 +140,16 @@ where
         payload: EncodeResult<Self::Payload>,
     ) -> Self::Request {
         let payload_bytes = payload.into_payload();
+        let record = R::new(&payload_bytes, &kinesis_metadata.partition_key);
 
-        if self.aggregation_mode {
-            // Create user record for aggregation
-            let user_record = UserRecord {
-                data: payload_bytes,
-                partition_key: kinesis_metadata.partition_key,
-                explicit_hash_key: None,
-                finalizers: kinesis_metadata.finalizers,
-                metadata,
-            };
-            KinesisBuilderOutput::Aggregation(KinesisUserRequest { user_record })
-        } else {
-            // Create standard kinesis record
-            let record = R::new(&payload_bytes, &kinesis_metadata.partition_key);
-            let kinesis_request = KinesisRequest {
-                key: KinesisKey {
-                    partition_key: kinesis_metadata.partition_key.clone(),
-                },
-                record,
-                finalizers: kinesis_metadata.finalizers,
-                metadata,
-            };
-            KinesisBuilderOutput::Standard(kinesis_request)
-        }
+        KinesisRequest::new(
+            KinesisKey {
+                partition_key: kinesis_metadata.partition_key.clone(),
+            },
+            record,
+            kinesis_metadata.finalizers,
+            metadata,
+        )
     }
 }
 
-// Request type for user records (pre-aggregation)
-#[derive(Clone)]
-pub struct KinesisUserRequest {
-    pub user_record: UserRecord,
-}
-
-impl Finalizable for KinesisUserRequest {
-    fn take_finalizers(&mut self) -> EventFinalizers {
-        self.user_record.take_finalizers()
-    }
-}
-
-impl MetaDescriptive for KinesisUserRequest {
-    fn get_metadata(&self) -> &RequestMetadata {
-        &self.user_record.metadata
-    }
-
-    fn metadata_mut(&mut self) -> &mut RequestMetadata {
-        &mut self.user_record.metadata
-    }
-}
-
-impl ByteSizeOf for KinesisUserRequest {
-    fn size_of(&self) -> usize {
-        // Return encoded size for batching
-        self.user_record.encoded_size()
-    }
-
-    fn allocated_bytes(&self) -> usize {
-        0
-    }
-}
