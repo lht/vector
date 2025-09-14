@@ -49,6 +49,7 @@ impl Record for KinesisStreamRecord {
 }
 
 impl KinesisStreamRecord {
+    #[allow(dead_code)] // Will be used when aggregation pipeline is implemented
     pub fn from_aggregated(aggregated: &super::aggregation::AggregatedRecord) -> Self {
         Self {
             record: KinesisRecord::builder()
