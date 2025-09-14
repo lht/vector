@@ -74,8 +74,10 @@ pub struct KinesisSinkBaseConfig {
     /// Enable KPL (Kinesis Producer Library) style aggregation.
     ///
     /// When enabled, multiple user records are packed into single Kinesis records
-    /// to improve throughput and reduce API calls. Records with the same partition
-    /// key will be aggregated together up to the specified limits.
+    /// to improve throughput and reduce API calls. Records are aggregated up to the
+    /// specified limits, with the first record's partition key used for the entire
+    /// aggregate. This may cause records with different partition keys to be routed
+    /// to the same shard.
     #[serde(default)]
     #[configurable(metadata(docs::advanced))]
     pub enable_aggregation: bool,
