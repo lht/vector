@@ -7,7 +7,6 @@ use super::{
     record::{Record, SendRecord},
     request_builder::KinesisRequestBuilder,
     sink::{BatchKinesisRequest, KinesisSink},
-    aggregation::KplAggregator,
 };
 use crate::{
     aws::{AwsAuthentication, RegionOrEndpoint},
@@ -71,28 +70,6 @@ pub struct KinesisSinkBaseConfig {
     #[configurable(metadata(docs::examples = "user_id"))]
     pub partition_key_field: Option<ConfigValuePath>,
 
-    /// Enable KPL (Kinesis Producer Library) style aggregation.
-    ///
-    /// When enabled, multiple user records are packed into single Kinesis records
-    /// to improve throughput and reduce API calls. Records are aggregated up to the
-    /// specified limits, with the first record's partition key used for the entire
-    /// aggregate. This may cause records with different partition keys to be routed
-    /// to the same shard.
-    #[serde(default)]
-    #[configurable(metadata(docs::advanced))]
-    pub enable_aggregation: bool,
-
-    /// Maximum number of user records to aggregate into a single Kinesis record.
-    ///
-    /// Higher values improve throughput but increase latency and retry payload size.
-    /// Must be between 1 and 1000. Only used when `enable_aggregation` is true.
-    #[serde(default = "default_max_records_per_aggregate")]
-    #[configurable(metadata(docs::advanced))]
-    pub max_records_per_aggregate: usize,
-}
-
-fn default_max_records_per_aggregate() -> usize {
-    100
 }
 
 impl KinesisSinkBaseConfig {
@@ -104,14 +81,6 @@ impl KinesisSinkBaseConfig {
         &self.acknowledgements
     }
 
-    pub fn validate_aggregation_config(&self) -> crate::Result<()> {
-        if self.enable_aggregation {
-            if self.max_records_per_aggregate == 0 || self.max_records_per_aggregate > 1000 {
-                return Err("max_records_per_aggregate must be between 1 and 1000".into());
-            }
-        }
-        Ok(())
-    }
 }
 
 /// Builds an aws_kinesis sink.
@@ -132,9 +101,6 @@ where
     E: Send + 'static,
     RT: RetryLogic<Request = BatchKinesisRequest<RR>, Response = KinesisResponse> + Default,
 {
-    // Validate aggregation config
-    config.validate_aggregation_config()?;
-    
     let request_limits = config.request.into_settings();
     let region = config.region.region();
     
@@ -152,17 +118,11 @@ where
     let serializer = config.encoding.build()?;
     let encoder = Encoder::<()>::new(serializer);
 
-    let aggregator = if config.enable_aggregation {
-        Some(KplAggregator::new(config.max_records_per_aggregate))
-    } else {
-        None
-    };
-
-    // Unified request builder that handles both modes
+    // Standard request builder (no aggregation at base level)
     let request_builder = KinesisRequestBuilder::<RR> {
         compression: config.compression,
         encoder: (transformer, encoder),
-        aggregation_mode: config.enable_aggregation,
+        aggregation_mode: false,
         _phantom: PhantomData,
     };
 
@@ -171,7 +131,7 @@ where
         service,
         request_builder,
         partition_key_field,
-        aggregator,
+        aggregator: None,
         _phantom: PhantomData,
     };
     Ok(VectorSink::from_event_streamsink(sink))

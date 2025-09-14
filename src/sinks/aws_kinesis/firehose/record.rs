@@ -34,13 +34,9 @@ impl Record for KinesisFirehoseRecord {
         self.record
     }
 
-    fn from_aggregated(aggregated: &super::super::aggregation::AggregatedRecord) -> Self {
-        Self {
-            record: KinesisRecord::builder()
-                .data(Blob::new(&aggregated.data[..]))
-                .build()
-                .expect("all builder records specified"),
-        }
+    fn from_aggregated(_aggregated: &super::super::aggregation::AggregatedRecord) -> Self {
+        // This should never be called since Firehose doesn't support aggregation
+        unreachable!("KPL aggregation is not supported by Kinesis Data Firehose")
     }
 }
 
