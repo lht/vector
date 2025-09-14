@@ -46,8 +46,10 @@ impl Record for KinesisStreamRecord {
     fn get(self) -> Self::T {
         self.record
     }
+}
 
-    fn from_aggregated(aggregated: &super::aggregation::AggregatedRecord) -> Self {
+impl KinesisStreamRecord {
+    pub fn from_aggregated(aggregated: &super::aggregation::AggregatedRecord) -> Self {
         Self {
             record: KinesisRecord::builder()
                 .data(Blob::new(&aggregated.data[..]))
@@ -58,42 +60,6 @@ impl Record for KinesisStreamRecord {
     }
 }
 
-#[derive(Clone)]
-#[allow(dead_code)] // Reserved for future aggregated record handling
-pub struct KinesisAggregatedStreamRecord {
-    pub record: KinesisRecord,
-    pub user_record_count: usize,
-}
-
-impl Record for KinesisAggregatedStreamRecord {
-    type T = KinesisRecord;
-
-    fn new(_payload_bytes: &Bytes, _partition_key: &str) -> Self {
-        // This shouldn't be called for aggregated records, use from_aggregated instead
-        panic!("Use from_aggregated for aggregated records, not new")
-    }
-
-    fn from_aggregated(aggregated: &super::aggregation::AggregatedRecord) -> Self {
-        Self {
-            record: KinesisRecord::builder()
-                .data(Blob::new(&aggregated.data[..]))
-                .partition_key(&aggregated.partition_key)
-                .build()
-                .expect("all required builder fields set"),
-            user_record_count: aggregated.user_record_count,
-        }
-    }
-
-    fn encoded_length(&self) -> usize {
-        // For aggregated records, return the actual data length
-        // since the KPL format is already optimized
-        self.record.data.as_ref().len() + self.record.partition_key.len() + 10
-    }
-
-    fn get(self) -> Self::T {
-        self.record
-    }
-}
 
 #[derive(Clone)]
 pub struct KinesisStreamClient {

@@ -44,7 +44,7 @@ where
         let batch_settings = self.batch_settings;
 
         input
-            .filter_map(move |event| {
+            .filter_map(|event| {
                 // Panic: This sink only accepts Logs, so this should never panic
                 let log = event.into_log();
                 let processed = process_log(log, self.partition_key_field.as_ref());
