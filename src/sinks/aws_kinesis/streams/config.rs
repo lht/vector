@@ -9,10 +9,11 @@ use vector_lib::configurable::{component::GenerateConfig, configurable_component
 use super::{
     KinesisClient, KinesisError, KinesisRecord, KinesisResponse, KinesisSinkBaseConfig,
     record::{KinesisStreamClient, KinesisStreamRecord},
-    sink::{BatchKinesisRequest, KinesisSink},
+    base_sink::{BatchKinesisRequest, KinesisSink},
     request_builder::KinesisRequestBuilder,
 };
 use super::aggregation::KplAggregator;
+use super::sink::StreamsKinesisSink;
 use crate::{
     aws::{ClientBuilder, create_client, is_retriable_error},
     config::{AcknowledgementsConfig, Input, ProxyConfig, SinkConfig, SinkContext},
@@ -205,16 +206,20 @@ impl SinkConfig for KinesisStreamsSinkConfig {
             _phantom: PhantomData,
         };
 
-        let sink = KinesisSink {
+        let base_sink = KinesisSink {
             batch_settings,
             service,
             request_builder,
             partition_key_field: self.base.partition_key_field.clone(),
-            aggregator,
             _phantom: PhantomData,
         };
 
-        Ok((VectorSink::from_event_streamsink(sink), healthcheck))
+        let streams_sink = StreamsKinesisSink {
+            base_sink,
+            aggregator,
+        };
+
+        Ok((VectorSink::from_event_streamsink(streams_sink), healthcheck))
     }
 
     fn input(&self) -> Input {

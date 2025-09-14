@@ -131,7 +131,6 @@ where
         service,
         request_builder,
         partition_key_field,
-        aggregator: None,
         _phantom: PhantomData,
     };
     Ok(VectorSink::from_event_streamsink(sink))
