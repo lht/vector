@@ -5,7 +5,7 @@ use vector_lib::{lookup::lookup_v2::ConfigValuePath, stream::BatcherSettings};
 use super::{
     KinesisResponse, KinesisService,
     record::{Record, SendRecord},
-    request_builder::{KinesisRequestBuilder, KinesisAggregationRequestBuilder},
+    request_builder::KinesisRequestBuilder,
     sink::{BatchKinesisRequest, KinesisSink},
     aggregation::KplAggregator,
 };
@@ -152,23 +152,17 @@ where
     let serializer = config.encoding.build()?;
     let encoder = Encoder::<()>::new(serializer);
 
-    let (aggregator, aggregation_request_builder) = if config.enable_aggregation {
-        let aggregator = Some(KplAggregator::new(config.max_records_per_aggregate));
-        let agg_builder = Some(KinesisAggregationRequestBuilder::<RR> {
-            compression: config.compression,
-            encoder: (transformer.clone(), encoder.clone()),
-            enable_aggregation: true,
-            _phantom: PhantomData,
-        });
-        (aggregator, agg_builder)
+    let aggregator = if config.enable_aggregation {
+        Some(KplAggregator::new(config.max_records_per_aggregate))
     } else {
-        (None, None)
+        None
     };
 
-    // Standard request builder for backward compatibility
+    // Unified request builder that handles both modes
     let request_builder = KinesisRequestBuilder::<RR> {
         compression: config.compression,
         encoder: (transformer, encoder),
+        aggregation_mode: config.enable_aggregation,
         _phantom: PhantomData,
     };
 
@@ -176,7 +170,6 @@ where
         batch_settings,
         service,
         request_builder,
-        aggregation_request_builder,
         partition_key_field,
         aggregator,
         _phantom: PhantomData,
