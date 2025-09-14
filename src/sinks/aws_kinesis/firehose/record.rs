@@ -33,7 +33,6 @@ impl Record for KinesisFirehoseRecord {
     fn get(self) -> Self::T {
         self.record
     }
-
 }
 
 #[derive(Clone)]

@@ -17,7 +17,6 @@ pub trait Record {
 
     /// Moves the contained record to the caller.
     fn get(self) -> Self::T;
-
 }
 
 /// Capable of sending records.
