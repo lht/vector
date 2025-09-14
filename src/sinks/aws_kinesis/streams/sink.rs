@@ -34,7 +34,7 @@ where
             }
         }
     }
-    
+
     async fn run_aggregated_pipeline(
         self: Box<Self>,
         input: BoxStream<'_, Event>,
@@ -78,7 +78,7 @@ where
                         let data = req.record.record.data.as_ref().to_vec().into();
                         let metadata = req.get_metadata().clone();
                         let finalizers = req.take_finalizers();
-                        
+
                         UserRecord {
                             data,
                             partition_key,
@@ -97,14 +97,14 @@ where
                     .into_iter()
                     .map(|agg_record| {
                         let kinesis_record = KinesisStreamRecord::from_aggregated(&agg_record);
-                        KinesisRequest::new(
-                            KinesisKey {
+                        KinesisRequest{
+                            key: KinesisKey {
                                 partition_key: agg_record.partition_key.clone(),
                             },
-                            kinesis_record,
-                            agg_record.finalizers,
-                            agg_record.metadata,
-                        )
+                            record: kinesis_record,
+                            finalizers: agg_record.finalizers,
+                            metadata: agg_record.metadata,
+                        }
                     })
                     .collect::<Vec<_>>();
 

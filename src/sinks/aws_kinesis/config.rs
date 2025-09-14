@@ -69,7 +69,6 @@ pub struct KinesisSinkBaseConfig {
     /// If not specified, a unique partition key is generated for each Kinesis record.
     #[configurable(metadata(docs::examples = "user_id"))]
     pub partition_key_field: Option<ConfigValuePath>,
-
 }
 
 impl KinesisSinkBaseConfig {
@@ -80,7 +79,6 @@ impl KinesisSinkBaseConfig {
     pub const fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
     }
-
 }
 
 /// Builds an aws_kinesis sink.
@@ -102,8 +100,8 @@ where
     RT: RetryLogic<Request = BatchKinesisRequest<RR>, Response = KinesisResponse> + Default,
 {
     let request_limits = config.request.into_settings();
+
     let region = config.region.region();
-    
     let service = ServiceBuilder::new()
         .settings::<RT, BatchKinesisRequest<RR>>(request_limits, retry_logic)
         .service(KinesisService::<C, R, E> {
@@ -118,7 +116,6 @@ where
     let serializer = config.encoding.build()?;
     let encoder = Encoder::<()>::new(serializer);
 
-    // Standard request builder (no aggregation at base level)
     let request_builder = KinesisRequestBuilder::<RR> {
         compression: config.compression,
         encoder: (transformer, encoder),

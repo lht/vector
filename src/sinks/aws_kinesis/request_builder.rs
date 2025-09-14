@@ -31,7 +31,6 @@ pub struct KinesisMetadata {
     pub partition_key: String,
 }
 
-
 #[derive(Clone)]
 pub struct KinesisRequest<R>
 where
@@ -40,7 +39,7 @@ where
     pub key: KinesisKey,
     pub record: R,
     pub finalizers: EventFinalizers,
-    metadata: RequestMetadata,
+    pub metadata: RequestMetadata,
 }
 
 impl<R> Finalizable for KinesisRequest<R>
@@ -78,25 +77,6 @@ where
 
     fn allocated_bytes(&self) -> usize {
         0
-    }
-}
-
-impl<R> KinesisRequest<R>
-where
-    R: Record,
-{
-    pub fn new(
-        key: KinesisKey,
-        record: R,
-        finalizers: EventFinalizers,
-        metadata: RequestMetadata,
-    ) -> Self {
-        Self {
-            key,
-            record,
-            finalizers,
-            metadata,
-        }
     }
 }
 
@@ -140,16 +120,16 @@ where
         payload: EncodeResult<Self::Payload>,
     ) -> Self::Request {
         let payload_bytes = payload.into_payload();
+
         let record = R::new(&payload_bytes, &kinesis_metadata.partition_key);
 
-        KinesisRequest::new(
-            KinesisKey {
+        KinesisRequest {
+            key: KinesisKey {
                 partition_key: kinesis_metadata.partition_key.clone(),
             },
             record,
-            kinesis_metadata.finalizers,
+            finalizers: kinesis_metadata.finalizers,
             metadata,
-        )
+        }
     }
 }
-
