@@ -83,7 +83,7 @@ where
                     metadata,
                 }
             })
-            .ready_chunks(1000) // Collect up to 1000 events for aggregation
+            .ready_chunks(100) // Smaller chunks to reduce latency; Vector's final batching provides timeout
             .flat_map(move |user_records_chunk: Vec<UserRecord>| {
                 // Apply aggregation to the chunk - this produces multiple aggregated records
                 let aggregated_records = aggregator.aggregate_records(user_records_chunk);
