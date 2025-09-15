@@ -119,6 +119,11 @@ impl KplAggregator {
         }
     }
 
+    /// Returns the maximum number of records per aggregate
+    pub fn max_records_per_aggregate(&self) -> usize {
+        self.max_records_per_aggregate
+    }
+
     /// Aggregate a batch of user records into aggregated records
     /// Uses the first record's partition key for the entire aggregate (AWS Fluent Bit strategy)
     pub fn aggregate_records(&self, user_records: Vec<UserRecord>) -> Vec<AggregatedRecord> {

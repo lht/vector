@@ -1,6 +1,7 @@
-use std::{fmt::Debug, num::NonZeroUsize, time::Duration};
+use std::{fmt::Debug, num::NonZeroUsize, time::Duration, pin::Pin, task::{Context, Poll}};
 
-use futures::StreamExt;
+use futures::{StreamExt, Stream};
+use tokio::time::{interval, Interval};
 use super::{aggregation::{KplAggregator, UserRecord}, record::KinesisStreamRecord};
 use super::super::sink::{KinesisSink, BatchKinesisRequest, KinesisKey, process_log};
 use super::super::request_builder::KinesisRequest;
@@ -8,7 +9,6 @@ use crate::{
     internal_events::SinkRequestBuildError,
     sinks::prelude::*,
 };
-
 
 /// Kinesis Streams-specific sink that supports KPL aggregation
 #[derive(Clone)]
@@ -43,6 +43,7 @@ where
     ) -> Result<(), ()> {
         let Self { base_sink, aggregator, .. } = *self;
         let aggregator = aggregator.expect("aggregator must be Some when calling run_aggregated_pipeline");
+        let max_records_per_aggregate = aggregator.max_records_per_aggregate();
         let KinesisSink {
             batch_settings: _,
             service,
@@ -84,13 +85,15 @@ where
                     metadata,
                 }
             })
-            .ready_chunks(10) // Small chunks (10 events) for low latency + timeout handled by final batching
+            // Use aggregation size for chunk size to maximize aggregation efficiency
+            // This allows chunks to fill aggregates to their configured capacity
+            .ready_chunks(max_records_per_aggregate)
             .flat_map(move |user_records_chunk: Vec<UserRecord>| {
                 // Apply aggregation to the chunk - this produces multiple aggregated records
                 let aggregated_records = aggregator.aggregate_records(user_records_chunk);
-                
-                // Convert each aggregated record to a KinesisRequest for the stream
-                futures::stream::iter(aggregated_records.into_iter().map(|agg_record| {
+
+                // Convert each aggregated record to a KinesisRequest
+                let kinesis_requests: Vec<_> = aggregated_records.into_iter().map(|agg_record| {
                     let kinesis_record = KinesisStreamRecord::from_aggregated(&agg_record);
                     KinesisRequest {
                         key: KinesisKey {
@@ -100,7 +103,9 @@ where
                         finalizers: agg_record.finalizers,
                         metadata: agg_record.metadata,
                     }
-                }))
+                }).collect();
+
+                futures::stream::iter(kinesis_requests)
             })
             .batched(
                 BatcherSettings::new(
@@ -114,9 +119,9 @@ where
                     aggregated_kinesis_requests.iter().map(|req| req.get_metadata().clone())
                 );
 
-                BatchKinesisRequest { 
-                    events: aggregated_kinesis_requests, 
-                    metadata 
+                BatchKinesisRequest {
+                    events: aggregated_kinesis_requests,
+                    metadata
                 }
             })
             .into_driver(service)
