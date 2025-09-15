@@ -9,6 +9,7 @@ use crate::{
     sinks::prelude::*,
 };
 
+
 /// Kinesis Streams-specific sink that supports KPL aggregation
 #[derive(Clone)]
 pub struct KinesisStreamsSink<S> {
@@ -83,7 +84,7 @@ where
                     metadata,
                 }
             })
-            .ready_chunks(100) // Smaller chunks to reduce latency; Vector's final batching provides timeout
+            .ready_chunks(10) // Small chunks (10 events) for low latency + timeout handled by final batching
             .flat_map(move |user_records_chunk: Vec<UserRecord>| {
                 // Apply aggregation to the chunk - this produces multiple aggregated records
                 let aggregated_records = aggregator.aggregate_records(user_records_chunk);
