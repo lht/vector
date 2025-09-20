@@ -1,7 +1,6 @@
-use std::{fmt::Debug, num::NonZeroUsize, time::Duration, pin::Pin, task::{Context, Poll}};
+use std::{fmt::Debug, num::NonZeroUsize, time::Duration};
 
-use futures::{StreamExt, Stream};
-use tokio::time::{interval, Interval};
+use futures::{StreamExt};
 use super::{aggregation::{KplAggregator, UserRecord}, record::KinesisStreamRecord};
 use super::super::sink::{KinesisSink, BatchKinesisRequest, KinesisKey, process_log};
 use super::super::request_builder::KinesisRequest;
