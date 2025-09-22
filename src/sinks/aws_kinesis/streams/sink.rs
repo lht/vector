@@ -1,6 +1,7 @@
-use std::{fmt::Debug, num::NonZeroUsize, time::Duration};
+use std::{fmt::Debug, num::NonZeroUsize};
 
 use futures::{StreamExt};
+use tokio_stream;
 use super::{aggregation::{KplAggregator, UserRecord}, record::KinesisStreamRecord};
 use super::super::sink::{KinesisSink, BatchKinesisRequest, KinesisKey, process_log};
 use super::super::request_builder::KinesisRequest;
@@ -43,15 +44,20 @@ where
         let Self { base_sink, aggregator, .. } = *self;
         let aggregator = aggregator.expect("aggregator must be Some when calling run_aggregated_pipeline");
         let max_records_per_aggregate = aggregator.max_records_per_aggregate();
+
         let KinesisSink {
-            batch_settings: _,
+            batch_settings,
             service,
             request_builder,
             partition_key_field,
             _phantom,
         } = base_sink;
 
-        futures::StreamExt::filter_map(input, move |event| {
+        // Use the configured batch timeout for chunk timeout
+        // This ensures chunks are emitted within the user-configured timeout period
+        let chunk_timeout = batch_settings.timeout;
+
+        let user_records_stream = futures::StreamExt::filter_map(input, move |event| {
                 let log = event.into_log();
                 future::ready(process_log(log, partition_key_field.as_ref()))
             })
@@ -83,10 +89,13 @@ where
                     finalizers,
                     metadata,
                 }
-            })
-            // Use aggregation size for chunk size to maximize aggregation efficiency
-            // This allows chunks to fill aggregates to their configured capacity
-            .ready_chunks(max_records_per_aggregate)
+            });
+
+        // Use tokio_stream chunks_timeout for proper timeout handling
+        // This will emit chunks when either:
+        // 1. max_records_per_aggregate records are collected, OR
+        // 2. chunk_timeout duration passes since the first record in current chunk
+        tokio_stream::StreamExt::chunks_timeout(user_records_stream, max_records_per_aggregate, chunk_timeout)
             .flat_map(move |user_records_chunk: Vec<UserRecord>| {
                 // Apply aggregation to the chunk - this produces multiple aggregated records
                 let aggregated_records = aggregator.aggregate_records(user_records_chunk);
@@ -108,7 +117,7 @@ where
             })
             .batched(
                 BatcherSettings::new(
-                    Duration::from_secs(1),
+                    batch_settings.timeout,  // Use consistent timeout from configuration
                     NonZeroUsize::new(5_000_000).unwrap(), // 5MB AWS limit
                     NonZeroUsize::new(500).unwrap()        // AWS Kinesis PutRecords limit
                 ).as_byte_size_config()
