@@ -1,4 +1,4 @@
-use std::{fmt::Debug, num::NonZeroUsize};
+use std::{fmt::Debug};
 
 use futures::{StreamExt};
 use tokio_stream;
@@ -53,10 +53,6 @@ where
             _phantom,
         } = base_sink;
 
-        // Use the configured batch timeout for chunk timeout
-        // This ensures chunks are emitted within the user-configured timeout period
-        let chunk_timeout = batch_settings.timeout;
-
         let user_records_stream = futures::StreamExt::filter_map(input, move |event| {
                 let log = event.into_log();
                 future::ready(process_log(log, partition_key_field.as_ref()))
@@ -95,7 +91,7 @@ where
         // This will emit chunks when either:
         // 1. max_records_per_aggregate records are collected, OR
         // 2. chunk_timeout duration passes since the first record in current chunk
-        tokio_stream::StreamExt::chunks_timeout(user_records_stream, max_records_per_aggregate, chunk_timeout)
+        tokio_stream::StreamExt::chunks_timeout(user_records_stream, max_records_per_aggregate, batch_settings.timeout)
             .flat_map(move |user_records_chunk: Vec<UserRecord>| {
                 // Apply aggregation to the chunk - this produces multiple aggregated records
                 let aggregated_records = aggregator.aggregate_records(user_records_chunk);
@@ -115,22 +111,12 @@ where
 
                 futures::stream::iter(kinesis_requests)
             })
-            .batched(
-                BatcherSettings::new(
-                    batch_settings.timeout,  // Use consistent timeout from configuration
-                    NonZeroUsize::new(5_000_000).unwrap(), // 5MB AWS limit
-                    NonZeroUsize::new(500).unwrap()        // AWS Kinesis PutRecords limit
-                ).as_byte_size_config()
-            )
-            .map(|aggregated_kinesis_requests: Vec<KinesisRequest<KinesisStreamRecord>>| {
+            .batched(batch_settings.as_byte_size_config())
+            .map(|events: Vec<KinesisRequest<KinesisStreamRecord>>| {
                 let metadata = RequestMetadata::from_batch(
-                    aggregated_kinesis_requests.iter().map(|req| req.get_metadata().clone())
+                   events.iter().map(|req| req.get_metadata().clone())
                 );
-
-                BatchKinesisRequest {
-                    events: aggregated_kinesis_requests,
-                    metadata
-                }
+                BatchKinesisRequest {events, metadata }
             })
             .into_driver(service)
             .run()
