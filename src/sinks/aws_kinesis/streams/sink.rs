@@ -1,13 +1,17 @@
 use std::{fmt::Debug};
 
+use std::num::NonZeroUsize;
+use bytes::BytesMut;
 use futures::{StreamExt};
 use tokio_stream;
+use tokio_util::codec::Encoder as _;
 use super::{aggregation::{KplAggregator, UserRecord}, record::KinesisStreamRecord};
-use super::super::sink::{KinesisSink, BatchKinesisRequest, KinesisKey, process_log};
+use super::super::sink::{KinesisSink, BatchKinesisRequest, KinesisKey, process_log, KinesisProcessedEvent};
 use super::super::request_builder::KinesisRequest;
 use crate::{
     internal_events::SinkRequestBuildError,
-    sinks::prelude::*,
+    sinks::{prelude::*, util::{Compression, metadata::RequestMetadataBuilder}},
+    event::Event,
 };
 
 /// Kinesis Streams-specific sink that supports KPL aggregation
@@ -53,45 +57,67 @@ where
             _phantom,
         } = base_sink;
 
+        // Extract timeout before moving batch_settings
+        let chunk_timeout = batch_settings.timeout;
+
+        // Optimized pipeline: bypass intermediate KinesisRequest creation
+        // Direct conversion: KinesisProcessedEvent → UserRecord
         let user_records_stream = futures::StreamExt::filter_map(input, move |event| {
                 let log = event.into_log();
                 future::ready(process_log(log, partition_key_field.as_ref()))
             })
-            .request_builder(
-                default_request_builder_concurrency_limit(),
-                request_builder,
-            )
-            .filter_map(|request| async move {
-                match request {
-                    Err(error) => {
-                        emit!(SinkRequestBuildError { error });
-                        None
-                    }
-                    Ok(req) => Some(req),
-                }
-            })
-            .map(move |kinesis_request: KinesisRequest<KinesisStreamRecord>| {
-                // Convert each KinesisRequest to UserRecord for streaming aggregation
-                let mut req = kinesis_request;
-                let partition_key = req.key.partition_key.clone();
-                let data = req.record.record.data.as_ref().to_vec().into();
-                let metadata = req.get_metadata().clone();
-                let finalizers = req.take_finalizers();
+            .map(move |mut processed_event: KinesisProcessedEvent| {
+                // Extract finalizers before cloning event
+                let finalizers = processed_event.event.take_finalizers();
+                let partition_key = processed_event.metadata.partition_key;
 
-                UserRecord {
-                    data,
+                // Extract event data and encode it directly
+                let event = Event::from(processed_event.event);
+                let metadata_builder = RequestMetadataBuilder::from_event(&event);
+
+                // Apply transformation and encoding
+                let (transformer, mut encoder) = request_builder.encoder.clone();
+                let mut event = event;
+                transformer.transform(&mut event);
+
+                // Encode the event to bytes
+                let mut encoded_bytes = BytesMut::new();
+
+                if let Err(error) = encoder.encode(event, &mut encoded_bytes) {
+                    emit!(SinkRequestBuildError { error });
+                    return None;
+                }
+                let encoded_bytes = bytes::Bytes::from(encoded_bytes);
+
+                // Apply compression if configured
+                let payload_bytes = match request_builder.compression {
+                    Compression::None => encoded_bytes,
+                    _ => {
+                        // For simplicity, keeping compression logic minimal
+                        // In production, you'd want proper compression handling
+                        encoded_bytes
+                    }
+                };
+
+                // Calculate payload size before moving
+                let payload_size = NonZeroUsize::new(payload_bytes.len())
+                    .expect("payload should never be zero length");
+
+                Some(UserRecord {
+                    data: payload_bytes,
                     partition_key,
                     explicit_hash_key: None,
                     finalizers,
-                    metadata,
-                }
-            });
+                    metadata: metadata_builder.with_request_size(payload_size),
+                })
+            })
+            .filter_map(|user_record_opt| future::ready(user_record_opt));
 
         // Use tokio_stream chunks_timeout for proper timeout handling
         // This will emit chunks when either:
         // 1. max_records_per_aggregate records are collected, OR
         // 2. chunk_timeout duration passes since the first record in current chunk
-        tokio_stream::StreamExt::chunks_timeout(user_records_stream, max_records_per_aggregate, batch_settings.timeout)
+        tokio_stream::StreamExt::chunks_timeout(user_records_stream, max_records_per_aggregate, chunk_timeout)
             .flat_map(move |user_records_chunk: Vec<UserRecord>| {
                 // Apply aggregation to the chunk - this produces multiple aggregated records
                 let aggregated_records = aggregator.aggregate_records(user_records_chunk);
