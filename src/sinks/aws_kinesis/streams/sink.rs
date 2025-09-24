@@ -1,16 +1,13 @@
 use std::{fmt::Debug};
 
-use std::num::NonZeroUsize;
-use bytes::BytesMut;
 use futures::{StreamExt};
 use tokio_stream;
-use tokio_util::codec::Encoder as _;
 use super::{aggregation::{KplAggregator, UserRecord}, record::KinesisStreamRecord};
-use super::super::sink::{KinesisSink, BatchKinesisRequest, KinesisKey, process_log, KinesisProcessedEvent};
+use super::super::sink::{KinesisSink, BatchKinesisRequest, KinesisKey, process_log};
 use super::super::request_builder::KinesisRequest;
 use crate::{
     internal_events::SinkRequestBuildError,
-    sinks::{prelude::*, util::{Compression, metadata::RequestMetadataBuilder}},
+    sinks::prelude::*,
     event::Event,
 };
 
@@ -60,58 +57,48 @@ where
         // Extract timeout before moving batch_settings
         let chunk_timeout = batch_settings.timeout;
 
-        // Optimized pipeline: bypass intermediate KinesisRequest creation
-        // Direct conversion: KinesisProcessedEvent → UserRecord
+        // Use RequestBuilder pipeline to ensure proper per-record compression
+        // This is necessary because KPL/KCL expects individual records to be compressed,
+        // not the entire aggregated blob
         let user_records_stream = futures::StreamExt::filter_map(input, move |event| {
                 let log = event.into_log();
                 future::ready(process_log(log, partition_key_field.as_ref()))
             })
-            .map(move |mut processed_event: KinesisProcessedEvent| {
-                // Extract finalizers before cloning event
-                let finalizers = processed_event.event.take_finalizers();
-                let partition_key = processed_event.metadata.partition_key;
-
-                // Extract event data and encode it directly
-                let event = Event::from(processed_event.event);
-                let metadata_builder = RequestMetadataBuilder::from_event(&event);
-
-                // Apply transformation and encoding
-                let (transformer, mut encoder) = request_builder.encoder.clone();
-                let mut event = event;
-                transformer.transform(&mut event);
-
-                // Encode the event to bytes
-                let mut encoded_bytes = BytesMut::new();
-
-                if let Err(error) = encoder.encode(event, &mut encoded_bytes) {
-                    emit!(SinkRequestBuildError { error });
-                    return None;
-                }
-                let encoded_bytes = bytes::Bytes::from(encoded_bytes);
-
-                // Apply compression if configured
-                let payload_bytes = match request_builder.compression {
-                    Compression::None => encoded_bytes,
-                    _ => {
-                        // For simplicity, keeping compression logic minimal
-                        // In production, you'd want proper compression handling
-                        encoded_bytes
+            .request_builder(
+                default_request_builder_concurrency_limit(),
+                request_builder,
+            )
+            .filter_map(|request| async move {
+                match request {
+                    Err(error) => {
+                        emit!(SinkRequestBuildError { error });
+                        None
                     }
-                };
+                    Ok(req) => Some(req),
+                }
+            })
+            .map(move |kinesis_request: KinesisRequest<KinesisStreamRecord>| {
+                // Convert KinesisRequest to UserRecord for aggregation
+                // The data is now properly compressed per Vector's compression settings
+                let mut req = kinesis_request;
 
-                // Calculate payload size before moving
-                let payload_size = NonZeroUsize::new(payload_bytes.len())
-                    .expect("payload should never be zero length");
+                // Extract metadata and finalizers first (before moving other fields)
+                let metadata = req.get_metadata().clone();  // Still need to clone metadata
+                let finalizers = req.take_finalizers();
 
-                Some(UserRecord {
-                    data: payload_bytes,
+                // Now extract the moved fields
+                let partition_key = req.key.partition_key;
+                let blob_data = req.record.record.data.into_inner();
+                let data = bytes::Bytes::from(blob_data);
+
+                UserRecord {
+                    data,
                     partition_key,
                     explicit_hash_key: None,
                     finalizers,
-                    metadata: metadata_builder.with_request_size(payload_size),
-                })
-            })
-            .filter_map(|user_record_opt| future::ready(user_record_opt));
+                    metadata,
+                }
+            });
 
         // Use tokio_stream chunks_timeout for proper timeout handling
         // This will emit chunks when either:
