@@ -83,7 +83,7 @@ where
                 let mut req = kinesis_request;
 
                 // Extract metadata and finalizers first (before moving other fields)
-                let metadata = req.get_metadata().clone();  // Still need to clone metadata
+                let metadata = req.get_metadata().clone();
                 let finalizers = req.take_finalizers();
 
                 // Now extract the moved fields
