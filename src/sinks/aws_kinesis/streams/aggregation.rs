@@ -24,14 +24,10 @@ pub struct UserRecord {
 }
 
 impl UserRecord {
-    /// Calculate the encoded size of this record in KPL format (binary protobuf-like).
-    /// 
-    /// Note: This calculates the size for the internal KPL binary format. AWS Kinesis
-    /// enforces the 1MB limit on this binary data (before Base64 encoding). Base64 
-    /// encoding is only used for JSON API transport and doesn't affect AWS size limits.
+    /// Calculate the encoded size of this record in KPL format.
     pub fn encoded_size(&self) -> usize {
         4 + // data length (u32)
-        self.data.len() + // data (binary, will be Base64 encoded at JSON layer)
+        self.data.len() + // data
         1 + // partition key length (u8)
         self.partition_key.len() + // partition key
         1 + // explicit hash key length (u8) - always present, 0 if None
@@ -125,7 +121,7 @@ impl KplAggregator {
     }
 
     /// Aggregate a batch of user records into aggregated records
-    /// Uses the first record's partition key for the entire aggregate (AWS Fluent Bit strategy)
+    /// Uses the first record's partition key for the entire aggregate
     pub fn aggregate_records(&self, user_records: Vec<UserRecord>) -> Vec<AggregatedRecord> {
         let mut aggregated_records = Vec::new();
         let mut current_batch = VecDeque::new();
@@ -136,6 +132,7 @@ impl KplAggregator {
 
             // Safety check: Skip records that are too large for any aggregate
             if record_size > self.max_aggregate_size {
+                // FIXME: remove logging. How to handle large event?
                 eprintln!(
                     "Warning: Skipping user record that is too large for aggregation. \
                      Record size: {} bytes, limit: {} bytes. \
@@ -340,11 +337,11 @@ mod tests {
         ];
 
         let aggregated = aggregator.aggregate_records(user_records);
-        
+
         // Should create one aggregate with only the normal records (large record skipped)
         assert_eq!(aggregated.len(), 1);
         assert_eq!(aggregated[0].user_record_count, 2); // Only 2 records (large one skipped)
-        
+
         // Verify the aggregated record is under the size limit
         assert!(aggregated[0].data.len() < 1_000_000); // Under 1MB
     }
