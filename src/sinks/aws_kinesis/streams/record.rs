@@ -60,7 +60,6 @@ impl KinesisStreamRecord {
     }
 }
 
-
 #[derive(Clone)]
 pub struct KinesisStreamClient {
     pub client: KinesisClient,

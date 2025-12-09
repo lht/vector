@@ -6,28 +6,28 @@ use futures::FutureExt;
 use snafu::Snafu;
 use vector_lib::configurable::{component::GenerateConfig, configurable_component};
 
-use super::{
-    KinesisClient, KinesisError, KinesisRecord, KinesisResponse, KinesisSinkBaseConfig,
-    record::{KinesisStreamClient, KinesisStreamRecord},
-    base_sink::{BatchKinesisRequest, KinesisSink},
-    request_builder::KinesisRequestBuilder,
-};
 use super::aggregation::KplAggregator;
 use super::sink::KinesisStreamsSink;
+use super::{
+    KinesisClient, KinesisError, KinesisRecord, KinesisResponse, KinesisSinkBaseConfig,
+    base_sink::{BatchKinesisRequest, KinesisSink},
+    record::{KinesisStreamClient, KinesisStreamRecord},
+    request_builder::KinesisRequestBuilder,
+};
 use crate::{
     aws::{ClientBuilder, create_client, is_retriable_error},
+    codecs::Encoder,
     config::{AcknowledgementsConfig, Input, ProxyConfig, SinkConfig, SinkContext},
     sinks::{
         Healthcheck, VectorSink,
+        prelude::ServiceBuilder,
         prelude::*,
         util::{
             BatchConfig, SinkBatchSettings,
             retries::{RetryAction, RetryLogic},
             service::ServiceBuilderExt,
         },
-        prelude::ServiceBuilder,
     },
-    codecs::Encoder,
 };
 use std::marker::PhantomData;
 
@@ -159,7 +159,7 @@ impl SinkConfig for KinesisStreamsSinkConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
         // Validate aggregation config
         self.validate_aggregation_config()?;
-        
+
         let client = self.create_client(&cx.proxy).await?;
         let healthcheck = self.clone().healthcheck(client.clone()).boxed();
 
@@ -173,21 +173,23 @@ impl SinkConfig for KinesisStreamsSinkConfig {
         // Build sink with aggregation support
         let request_limits = self.base.request.into_settings();
         let region = self.base.region.region();
-        
+
         let service = ServiceBuilder::new()
             .settings::<KinesisRetryLogic, BatchKinesisRequest<KinesisStreamRecord>>(
-                request_limits, 
+                request_limits,
                 KinesisRetryLogic {
                     retry_partial: self.base.request_retry_partial,
-                }
+                },
             )
-            .service(super::KinesisService::<KinesisStreamClient, KinesisRecord, KinesisError> {
-                client: KinesisStreamClient { client },
-                stream_name: self.base.stream_name.clone(),
-                region,
-                _phantom_t: PhantomData,
-                _phantom_e: PhantomData,
-            });
+            .service(
+                super::KinesisService::<KinesisStreamClient, KinesisRecord, KinesisError> {
+                    client: KinesisStreamClient { client },
+                    stream_name: self.base.stream_name.clone(),
+                    region,
+                    _phantom_t: PhantomData,
+                    _phantom_e: PhantomData,
+                },
+            );
 
         let transformer = self.base.encoding.transformer();
         let serializer = self.base.encoding.build()?;

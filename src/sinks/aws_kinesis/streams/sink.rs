@@ -1,15 +1,14 @@
-use std::{fmt::Debug};
+use std::fmt::Debug;
 
-use futures::{StreamExt};
-use tokio_stream;
-use super::{aggregation::{KplAggregator, UserRecord}, record::KinesisStreamRecord};
-use super::super::sink::{KinesisSink, BatchKinesisRequest, KinesisKey, process_log};
 use super::super::request_builder::KinesisRequest;
-use crate::{
-    internal_events::SinkRequestBuildError,
-    sinks::prelude::*,
-    event::Event,
+use super::super::sink::{BatchKinesisRequest, KinesisKey, KinesisSink, process_log};
+use super::{
+    aggregation::{KplAggregator, UserRecord},
+    record::KinesisStreamRecord,
 };
+use crate::{event::Event, internal_events::SinkRequestBuildError, sinks::prelude::*};
+use futures::StreamExt;
+use tokio_stream;
 
 /// Kinesis Streams-specific sink that supports KPL aggregation
 #[derive(Clone)]
@@ -42,8 +41,13 @@ where
         self: Box<Self>,
         input: BoxStream<'_, Event>,
     ) -> Result<(), ()> {
-        let Self { base_sink, aggregator, .. } = *self;
-        let aggregator = aggregator.expect("aggregator must be Some when calling run_aggregated_pipeline");
+        let Self {
+            base_sink,
+            aggregator,
+            ..
+        } = *self;
+        let aggregator =
+            aggregator.expect("aggregator must be Some when calling run_aggregated_pipeline");
         let max_records_per_aggregate = aggregator.max_records_per_aggregate();
 
         let KinesisSink {
@@ -61,23 +65,21 @@ where
         // This is necessary because KPL/KCL expects individual records to be compressed,
         // not the entire aggregated blob
         let user_records_stream = futures::StreamExt::filter_map(input, move |event| {
-                let log = event.into_log();
-                future::ready(process_log(log, partition_key_field.as_ref()))
-            })
-            .request_builder(
-                default_request_builder_concurrency_limit(),
-                request_builder,
-            )
-            .filter_map(|request| async move {
-                match request {
-                    Err(error) => {
-                        emit!(SinkRequestBuildError { error });
-                        None
-                    }
-                    Ok(req) => Some(req),
+            let log = event.into_log();
+            future::ready(process_log(log, partition_key_field.as_ref()))
+        })
+        .request_builder(default_request_builder_concurrency_limit(), request_builder)
+        .filter_map(|request| async move {
+            match request {
+                Err(error) => {
+                    emit!(SinkRequestBuildError { error });
+                    None
                 }
-            })
-            .map(move |kinesis_request: KinesisRequest<KinesisStreamRecord>| {
+                Ok(req) => Some(req),
+            }
+        })
+        .map(
+            move |kinesis_request: KinesisRequest<KinesisStreamRecord>| {
                 // Convert KinesisRequest to UserRecord for aggregation
                 // The data is now properly compressed per Vector's compression settings
                 let mut req = kinesis_request;
@@ -98,19 +100,26 @@ where
                     finalizers,
                     metadata,
                 }
-            });
+            },
+        );
 
         // Use tokio_stream chunks_timeout for proper timeout handling
         // This will emit chunks when either:
         // 1. max_records_per_aggregate records are collected, OR
         // 2. chunk_timeout duration passes since the first record in current chunk
-        tokio_stream::StreamExt::chunks_timeout(user_records_stream, max_records_per_aggregate, chunk_timeout)
-            .flat_map(move |user_records_chunk: Vec<UserRecord>| {
-                // Apply aggregation to the chunk - this produces multiple aggregated records
-                let aggregated_records = aggregator.aggregate_records(user_records_chunk);
+        tokio_stream::StreamExt::chunks_timeout(
+            user_records_stream,
+            max_records_per_aggregate,
+            chunk_timeout,
+        )
+        .flat_map(move |user_records_chunk: Vec<UserRecord>| {
+            // Apply aggregation to the chunk - this produces multiple aggregated records
+            let aggregated_records = aggregator.aggregate_records(user_records_chunk);
 
-                // Convert each aggregated record to a KinesisRequest
-                let kinesis_requests: Vec<_> = aggregated_records.into_iter().map(|agg_record| {
+            // Convert each aggregated record to a KinesisRequest
+            let kinesis_requests: Vec<_> = aggregated_records
+                .into_iter()
+                .map(|agg_record| {
                     let kinesis_record = KinesisStreamRecord::from_aggregated(&agg_record);
                     KinesisRequest {
                         key: KinesisKey {
@@ -120,20 +129,20 @@ where
                         finalizers: agg_record.finalizers,
                         metadata: agg_record.metadata,
                     }
-                }).collect();
+                })
+                .collect();
 
-                futures::stream::iter(kinesis_requests)
-            })
-            .batched(batch_settings.as_byte_size_config())
-            .map(|events: Vec<KinesisRequest<KinesisStreamRecord>>| {
-                let metadata = RequestMetadata::from_batch(
-                   events.iter().map(|req| req.get_metadata().clone())
-                );
-                BatchKinesisRequest {events, metadata }
-            })
-            .into_driver(service)
-            .run()
-            .await
+            futures::stream::iter(kinesis_requests)
+        })
+        .batched(batch_settings.as_byte_size_config())
+        .map(|events: Vec<KinesisRequest<KinesisStreamRecord>>| {
+            let metadata =
+                RequestMetadata::from_batch(events.iter().map(|req| req.get_metadata().clone()));
+            BatchKinesisRequest { events, metadata }
+        })
+        .into_driver(service)
+        .run()
+        .await
     }
 }
 

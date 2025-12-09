@@ -1,8 +1,160 @@
-use std::collections::VecDeque;
-use bytes::{Bytes, BytesMut, BufMut};
-use md5::{Md5, Digest};
+//! # Kinesis Producer Library (KPL) Aggregation Format
+//!
+//! This module implements the KPL aggregation format for AWS Kinesis streams.
+//! KPL aggregation allows multiple user records to be packed into a single Kinesis record,
+//! improving throughput and reducing costs.
+//!
+//! ## KPL Aggregation Overview
+//!
+//! ```text
+//! +-------------------------------------------------------------------------------+
+//! |                           USER RECORDS (Application)                          |
+//! +-------------------------------------------------------------------------------+
+//!
+//!   UserRecord 1          UserRecord 2          UserRecord 3          UserRecord 4
+//! +--------------+      +--------------+      +--------------+      +--------------+
+//! | Data: "..."  |      | Data: "..."  |      | Data: "..."  |      | Data: "..."  |
+//! | PKey: "A"    |      | PKey: "A"    |      | PKey: "B"    |      | PKey: "B"    |
+//! | EHKey: null  |      | EHKey: "X"   |      | EHKey: null  |      | EHKey: "Y"   |
+//! +--------------+      +--------------+      +--------------+      +--------------+
+//!        |                     |                     |                     |
+//!        +----------+----------+                     +----------+----------+
+//!                   |                                           |
+//!                   v                                           v
+//! +-------------------------------------------------------------------------------+
+//! |                        AGGREGATED RECORDS (KPL Format)                        |
+//! +-------------------------------------------------------------------------------+
+//!
+//!     Aggregated Record 1                          Aggregated Record 2
+//! +----------------------------+              +----------------------------+
+//! | +--------+                 |              | +--------+                 |
+//! | | Magic  | (4 bytes)       |              | | Magic  | (4 bytes)       |
+//! | |0xF3899AC2                |              | |0xF3899AC2                |
+//! | +--------+                 |              | +--------+                 |
+//! | +----------------------+   |              | +----------------------+   |
+//! | |   Protobuf Message   |   |              | |   Protobuf Message   |   |
+//! | | +------------------+ |   |              | | +------------------+ |   |
+//! | | |partition_key     | |   |              | | |partition_key     | |   |
+//! | | |  _table ["A"]    | |   |              | | |  _table ["B"]    | |   |
+//! | | +------------------+ |   |              | | +------------------+ |   |
+//! | | +------------------+ |   |              | | +------------------+ |   |
+//! | | |explicit_hash_key | |   |              | | |explicit_hash_key | |   |
+//! | | |  _table ["X"]    | |   |              | | |  _table ["Y"]    | |   |
+//! | | +------------------+ |   |              | | +------------------+ |   |
+//! | | +------------------+ |   |              | | +------------------+ |   |
+//! | | | records[]        | |   |              | | | records[]        | |   |
+//! | | |  Record 1:       | |   |              | | |  Record 3:       | |   |
+//! | | |   pk_index: 0    | |   |              | | |   pk_index: 0    | |   |
+//! | | |   ehk_index: -   | |   |              | | |   ehk_index: -   | |   |
+//! | | |   data: "..."    | |   |              | | |   data: "..."    | |   |
+//! | | |  Record 2:       | |   |              | | |  Record 4:       | |   |
+//! | | |   pk_index: 0    | |   |              | | |   pk_index: 0    | |   |
+//! | | |   ehk_index: 0   | |   |              | | |   ehk_index: 0   | |   |
+//! | | |   data: "..."    | |   |              | | |   data: "..."    | |   |
+//! | | +------------------+ |   |              | | +------------------+ |   |
+//! | +----------------------+   |              | +----------------------+   |
+//! | +--------+                 |              | +--------+                 |
+//! | |MD5 Sum | (16 bytes)      |              | |MD5 Sum | (16 bytes)      |
+//! | |of Proto|                 |              | |of Proto|                 |
+//! | +--------+                 |              | +--------+                 |
+//! |                            |              |                            |
+//! | Partition Key: "A"         |              | Partition Key: "B"         |
+//! | User Record Count: 2       |              | User Record Count: 2       |
+//! | Size: ~950KB max           |              | Size: ~950KB max           |
+//! +----------------------------+              +----------------------------+
+//!        |                                            |
+//!        +------------------+--------------------------+
+//!                           |
+//!                           v
+//! +-------------------------------------------------------------------------------+
+//! |                    BATCHING FOR PUTRECORDS API CALL                           |
+//! +-------------------------------------------------------------------------------+
+//!
+//! PutRecords API Request (max 500 records or 5MB per request)
+//! +------------------------------------------------------------------------------+
+//! | StreamName: "my-stream"                                                      |
+//! | Records: [                                                                   |
+//! |   {                                                                          |
+//! |     Data: <Aggregated Record 1 binary>  // Contains 2 user records          |
+//! |     PartitionKey: "A"                                                        |
+//! |   },                                                                         |
+//! |   {                                                                          |
+//! |     Data: <Aggregated Record 2 binary>  // Contains 2 user records          |
+//! |     PartitionKey: "B"                                                        |
+//! |   },                                                                         |
+//! |   ... (up to 500 aggregated records)                                         |
+//! | ]                                                                            |
+//! +------------------------------------------------------------------------------+
+//!                           |
+//!                           v
+//! +-------------------------------------------------------------------------------+
+//! |                        AWS KINESIS DATA STREAM                                |
+//! |                                                                               |
+//! |  Shard 1                      Shard 2                      Shard N           |
+//! | +---------+                  +---------+                  +---------+        |
+//! | | Agg 1   |                  | Agg 2   |                  | ...     |        |
+//! | | (2 user)|                  | (2 user)|                  |         |        |
+//! | +---------+                  +---------+                  +---------+        |
+//! +-------------------------------------------------------------------------------+
+//! ```
+//!
+//! ## Benefits of KPL Aggregation
+//!
+//! - **Improved Throughput**: Pack multiple small records into fewer Kinesis records
+//! - **Cost Reduction**: Pay for fewer PUT operations (Kinesis charges per record)
+//! - **Better Shard Utilization**: More efficient use of shard write capacity (1MB/sec or 1000 records/sec)
+//! - **Deduplication**: Partition keys and explicit hash keys are stored once per aggregate
+//!
+//! ## Format Details
+//!
+//! ### Aggregated Record Structure
+//! ```text
+//! [ 4 bytes Magic ] [ Variable Protobuf Data ] [ 16 bytes MD5 ]
+//! ```
+//!
+//! - **Magic**: `0xF3 0x89 0x9A 0xC2` - Identifies the record as KPL aggregated
+//! - **Protobuf Data**: Protocol Buffer encoded `AggregatedRecord` message
+//! - **MD5 Checksum**: MD5 hash of the protobuf data for integrity verification
+//!
+//! ### Protobuf Schema (simplified)
+//! ```protobuf
+//! message AggregatedRecord {
+//!   repeated string partition_key_table = 1;        // Deduplicated partition keys
+//!   repeated string explicit_hash_key_table = 2;    // Deduplicated explicit hash keys
+//!   repeated Record records = 3;                    // User records with indices
+//! }
+//!
+//! message Record {
+//!   uint64 partition_key_index = 1;                 // Index into partition_key_table
+//!   optional uint64 explicit_hash_key_index = 2;    // Index into explicit_hash_key_table
+//!   bytes data = 3;                                 // User record data
+//!   repeated Tag tags = 4;                          // Optional tags
+//! }
+//! ```
+//!
+//! ## Size Limits
+//!
+//! - **Max Aggregated Record Size**: 950KB (leaves room for overhead under 1MB AWS limit)
+//! - **Max Records per Aggregate**: Configurable (default varies by implementation)
+//! - **Max PutRecords Batch**: 500 records or 5MB total per API call
+//! - **Individual User Record**: No specific limit, but must fit within aggregate
+//!
+//! ## References
+//!
+//! - [AWS KPL Concepts](https://docs.aws.amazon.com/streams/latest/dev/kinesis-kpl-concepts.html)
+//! - [KPL Aggregation Format](https://github.com/a8m/kinesis-producer/blob/master/aggregation-format.md)
+
 use crate::event::{EventFinalizers, Finalizable};
-use vector_lib::{request_metadata::RequestMetadata, ByteSizeOf};
+use bytes::{BufMut, Bytes, BytesMut};
+use md5::{Digest, Md5};
+use prost::Message;
+use std::collections::{HashMap, VecDeque};
+use vector_lib::{ByteSizeOf, request_metadata::RequestMetadata};
+
+// Include the generated protobuf code
+pub mod kpl_proto {
+    include!(concat!(env!("OUT_DIR"), "/kpl_aggregation.rs"));
+}
 
 // KPL Magic bytes - identifies this as a KPL aggregated record
 const KPL_MAGIC: [u8; 4] = [0xF3, 0x89, 0x9A, 0xC2];
@@ -24,41 +176,15 @@ pub struct UserRecord {
 }
 
 impl UserRecord {
-    /// Calculate the encoded size of this record in KPL format.
+    /// Calculate the estimated encoded size of this record in protobuf format.
+    /// This is an approximation used for buffer size calculations.
     pub fn encoded_size(&self) -> usize {
-        4 + // data length (u32)
-        self.data.len() + // data
-        1 + // partition key length (u8)
-        self.partition_key.len() + // partition key
-        1 + // explicit hash key length (u8) - always present, 0 if None
-        self.explicit_hash_key.as_ref().map_or(0, |k| k.len()) // explicit hash key data (if any)
-    }
-
-    /// Encode this record into the KPL format
-    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), String> {
-        // Data length + data
-        buf.put_u32(self.data.len() as u32);
-        buf.put_slice(&self.data);
-
-        // Partition key length + partition key (AWS Kinesis limit: 256 bytes, u8 supports 0-255)
-        if self.partition_key.len() > 255 {
-            return Err(format!("Partition key too long: {} bytes (max 255)", self.partition_key.len()));
-        }
-        buf.put_u8(self.partition_key.len() as u8);
-        buf.put_slice(&self.partition_key.as_bytes());
-
-        // Explicit hash key length + explicit hash key
-        if let Some(ref hash_key) = self.explicit_hash_key {
-            if hash_key.len() > 255 {
-                return Err(format!("Explicit hash key too long: {} bytes (max 255)", hash_key.len()));
-            }
-            buf.put_u8(hash_key.len() as u8);
-            buf.put_slice(&hash_key.as_bytes());
-        } else {
-            buf.put_u8(0);
-        }
-
-        Ok(())
+        // Approximate protobuf overhead: field tags, lengths, etc.
+        // partition_key_index field (varint) + data field + tags
+        self.data.len()
+            + self.partition_key.len()
+            + self.explicit_hash_key.as_ref().map_or(0, |k| k.len())
+            + 20 // overhead estimate
     }
 }
 
@@ -74,8 +200,9 @@ impl ByteSizeOf for UserRecord {
     }
 
     fn allocated_bytes(&self) -> usize {
-        self.data.len() + self.partition_key.len() +
-        self.explicit_hash_key.as_ref().map_or(0, |k| k.len())
+        self.data.len()
+            + self.partition_key.len()
+            + self.explicit_hash_key.as_ref().map_or(0, |k| k.len())
     }
 }
 
@@ -169,36 +296,85 @@ impl KplAggregator {
         aggregated_records
     }
 
-    /// Create an aggregated record from a batch of user records
-    fn create_aggregated_record(&self, user_records: &mut VecDeque<UserRecord>) -> Option<AggregatedRecord> {
+    /// Create an aggregated record from a batch of user records using protobuf
+    fn create_aggregated_record(
+        &self,
+        user_records: &mut VecDeque<UserRecord>,
+    ) -> Option<AggregatedRecord> {
         if user_records.is_empty() {
             return None;
         }
 
-        // Estimate buffer size
-        let estimated_size = user_records.iter()
-            .map(|r| r.encoded_size())
-            .sum::<usize>() + 24; // magic + count + md5
+        // Build partition key and explicit hash key tables
+        let mut partition_key_table: Vec<String> = Vec::new();
+        let mut partition_key_indices: HashMap<String, u64> = HashMap::new();
+        let mut explicit_hash_key_table: Vec<String> = Vec::new();
+        let mut explicit_hash_key_indices: HashMap<String, u64> = HashMap::new();
 
-        let mut buf = BytesMut::with_capacity(estimated_size);
+        // Build protobuf records
+        let mut proto_records = Vec::new();
+
+        for user_record in user_records.iter() {
+            // Get or insert partition key
+            let pk_index = if let Some(&idx) = partition_key_indices.get(&user_record.partition_key)
+            {
+                idx
+            } else {
+                let idx = partition_key_table.len() as u64;
+                partition_key_table.push(user_record.partition_key.clone());
+                partition_key_indices.insert(user_record.partition_key.clone(), idx);
+                idx
+            };
+
+            // Get or insert explicit hash key (if present)
+            let ehk_index = if let Some(ref ehk) = user_record.explicit_hash_key {
+                let idx = if let Some(&idx) = explicit_hash_key_indices.get(ehk) {
+                    idx
+                } else {
+                    let idx = explicit_hash_key_table.len() as u64;
+                    explicit_hash_key_table.push(ehk.clone());
+                    explicit_hash_key_indices.insert(ehk.clone(), idx);
+                    idx
+                };
+                Some(idx)
+            } else {
+                None
+            };
+
+            proto_records.push(kpl_proto::Record {
+                partition_key_index: pk_index,
+                explicit_hash_key_index: ehk_index,
+                data: user_record.data.to_vec(),
+                tags: vec![], // Tags not currently used
+            });
+        }
+
+        // Create the aggregated record protobuf message
+        let aggregated = kpl_proto::AggregatedRecord {
+            partition_key_table,
+            explicit_hash_key_table,
+            records: proto_records,
+        };
+
+        // Serialize the protobuf message
+        let mut protobuf_data = Vec::new();
+        if let Err(e) = aggregated.encode(&mut protobuf_data) {
+            eprintln!("Error encoding protobuf: {}", e);
+            return None;
+        }
+
+        // Build the final KPL format: [magic][protobuf][md5]
+        let mut buf = BytesMut::with_capacity(4 + protobuf_data.len() + 16);
 
         // Write KPL magic
         buf.put_slice(&KPL_MAGIC);
 
-        // Write record count
-        buf.put_u32(user_records.len() as u32);
+        // Write protobuf data
+        buf.put_slice(&protobuf_data);
 
-        // Write all user records
-        for user_record in user_records.iter() {
-            if let Err(e) = user_record.encode(&mut buf) {
-                eprintln!("Error encoding user record: {}", e);
-                return None;
-            }
-        }
-
-        // Calculate and write MD5 checksum
+        // Calculate and write MD5 checksum of the protobuf data only
         let mut hasher = Md5::new();
-        hasher.update(&buf[8..]); // Skip magic and count for checksum
+        hasher.update(&protobuf_data);
         let checksum = hasher.finalize();
         buf.put_slice(&checksum);
 
@@ -232,7 +408,7 @@ mod tests {
     use bytes::Bytes;
 
     #[test]
-    fn test_user_record_encoding() {
+    fn test_user_record_size_estimation() {
         let user_record = UserRecord {
             data: Bytes::from("test data"),
             partition_key: "test_key".to_string(),
@@ -241,11 +417,10 @@ mod tests {
             metadata: RequestMetadata::default(),
         };
 
-        let mut buf = BytesMut::new();
-        user_record.encode(&mut buf).unwrap();
-
-        // Verify the encoding format
-        assert_eq!(buf.len(), 4 + 9 + 1 + 8 + 1); // data_len + data + pk_len + pk + hk_len
+        // Just verify that encoded_size returns a reasonable estimate
+        let size = user_record.encoded_size();
+        assert!(size > 0);
+        assert!(size >= user_record.data.len());
     }
 
     #[test]
@@ -276,10 +451,33 @@ mod tests {
 
         // Verify KPL magic
         assert_eq!(&aggregated[0].data[0..4], &KPL_MAGIC);
+
+        // Verify the format: [magic][protobuf][md5]
+        let data = &aggregated[0].data;
+        assert!(data.len() > 20); // At least magic + some protobuf + md5
+
+        // Extract and verify protobuf can be decoded
+        let protobuf_data = &data[4..data.len() - 16]; // Skip magic and md5
+        let decoded = kpl_proto::AggregatedRecord::decode(protobuf_data);
+        assert!(decoded.is_ok(), "Protobuf should decode successfully");
+
+        let decoded = decoded.unwrap();
+        assert_eq!(decoded.partition_key_table.len(), 1);
+        assert_eq!(decoded.partition_key_table[0], "key1");
+        assert_eq!(decoded.records.len(), 2);
+        assert_eq!(decoded.records[0].data, b"record1");
+        assert_eq!(decoded.records[1].data, b"record2");
+
+        // Verify MD5 checksum
+        let mut hasher = Md5::new();
+        hasher.update(protobuf_data);
+        let expected_checksum = hasher.finalize();
+        let actual_checksum = &data[data.len() - 16..];
+        assert_eq!(actual_checksum, expected_checksum.as_slice());
     }
 
     #[test]
-    fn test_first_partition_key_strategy() {
+    fn test_partition_key_table_deduplication() {
         let aggregator = KplAggregator::new(100);
 
         let user_records = vec![
@@ -297,13 +495,37 @@ mod tests {
                 finalizers: EventFinalizers::default(),
                 metadata: RequestMetadata::default(),
             },
+            UserRecord {
+                data: Bytes::from("record3"),
+                partition_key: "key1".to_string(), // Same as first - should be deduplicated
+                explicit_hash_key: None,
+                finalizers: EventFinalizers::default(),
+                metadata: RequestMetadata::default(),
+            },
         ];
 
         let aggregated = aggregator.aggregate_records(user_records);
-        // Should create single aggregate using first record's partition key
         assert_eq!(aggregated.len(), 1);
-        assert_eq!(aggregated[0].user_record_count, 2);
+        assert_eq!(aggregated[0].user_record_count, 3);
         assert_eq!(aggregated[0].partition_key, "key1"); // Uses first record's key
+
+        // Verify protobuf has deduplicated partition keys
+        let data = &aggregated[0].data;
+        let protobuf_data = &data[4..data.len() - 16];
+        let decoded = kpl_proto::AggregatedRecord::decode(protobuf_data).unwrap();
+
+        // Should only have 2 unique partition keys in the table
+        assert_eq!(decoded.partition_key_table.len(), 2);
+        assert!(decoded.partition_key_table.contains(&"key1".to_string()));
+        assert!(decoded.partition_key_table.contains(&"key2".to_string()));
+
+        // Verify records reference the correct indices
+        assert_eq!(decoded.records.len(), 3);
+        // First and third records should reference the same partition key index
+        assert_eq!(
+            decoded.records[0].partition_key_index,
+            decoded.records[2].partition_key_index
+        );
     }
 
     #[test]
