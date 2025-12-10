@@ -96,7 +96,6 @@ where
                 UserRecord {
                     data,
                     partition_key,
-                    explicit_hash_key: None,
                     finalizers,
                     metadata,
                 }

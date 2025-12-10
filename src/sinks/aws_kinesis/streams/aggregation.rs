@@ -70,12 +70,10 @@
 //! |   {                                                                          |
 //! |     Data: <Aggregated Record 1 binary>  // Contains 2 user records           |
 //! |     PartitionKey: "key_abc123"                                               |
-//! |     ExplicitHashKey: "12345..." (optional - for shard control)               |
 //! |   },                                                                         |
 //! |   {                                                                          |
 //! |     Data: <Aggregated Record 2 binary>  // Contains 2 user records           |
 //! |     PartitionKey: "key_xyz789"                                               |
-//! |     ExplicitHashKey: "67890..." (optional - for shard control)               |
 //! |   },                                                                         |
 //! |   ... (up to 500 aggregated records)                                         |
 //! | ]                                                                            |
@@ -97,7 +95,6 @@
 //! - All records in an aggregate share a single partition key
 //! - The partition key table contains exactly one entry
 //! - All records reference partition_key_index = 0
-//! - explicit_hash_key_table is always empty (not used)
 //! - This ensures the aggregated record is correctly associated with its Kinesis shard
 //!
 //! ## Size Limits
@@ -135,7 +132,6 @@ const KPL_FIXED_OVERHEAD: usize = 20;
 
 // Protobuf base overhead per aggregated record:
 //   - partition_key_table: 1 key (16 chars × 4 bytes Unicode = 64) + encoding (2) = 66 bytes
-//   - explicit_hash_key_table: empty, just encoding = 2 bytes
 //   - Total: 68 bytes, rounded to 80 for safety buffer
 const PROTOBUF_BASE_OVERHEAD: usize = 80;
 
@@ -153,8 +149,6 @@ pub struct UserRecord {
     pub data: Bytes,
     /// Partition key for this record
     pub partition_key: String,
-    /// Optional explicit hash key
-    pub explicit_hash_key: Option<String>,
     /// Event finalizers for acknowledgment
     pub finalizers: EventFinalizers,
     /// Request metadata
@@ -165,7 +159,6 @@ impl UserRecord {
     /// Calculate the estimated encoded size of this record in protobuf format.
     /// This is an approximation used for buffer size calculations.
     pub fn encoded_size(&self) -> usize {
-        // Note: explicit_hash_key is NOT encoded in KPL protobuf (always set to None)
         // Only the data is encoded in the protobuf, plus minimal overhead
         self.data.len() + 20 // data + overhead estimate
     }
@@ -450,14 +443,12 @@ mod tests {
             UserRecord {
                 data: Bytes::from("record1"),
                 partition_key: "key1".to_string(),
-                explicit_hash_key: None,
                 finalizers: EventFinalizers::default(),
                 metadata: RequestMetadata::default(),
             },
             UserRecord {
                 data: Bytes::from("record2"),
                 partition_key: "key1".to_string(),
-                explicit_hash_key: None,
                 finalizers: EventFinalizers::default(),
                 metadata: RequestMetadata::default(),
             },
@@ -505,21 +496,18 @@ mod tests {
             UserRecord {
                 data: Bytes::from("normal record"),
                 partition_key: "key1".to_string(),
-                explicit_hash_key: None,
                 finalizers: EventFinalizers::default(),
                 metadata: RequestMetadata::default(),
             },
             UserRecord {
                 data: Bytes::from(large_data), // This record is too large
                 partition_key: "key2".to_string(),
-                explicit_hash_key: None,
                 finalizers: EventFinalizers::default(),
                 metadata: RequestMetadata::default(),
             },
             UserRecord {
                 data: Bytes::from("another normal record"),
                 partition_key: "key3".to_string(),
-                explicit_hash_key: None,
                 finalizers: EventFinalizers::default(),
                 metadata: RequestMetadata::default(),
             },
@@ -554,14 +542,12 @@ mod tests {
             UserRecord {
                 data: Bytes::from("record1"),
                 partition_key: "\u{109ea2}\u{0c69dd}\u{076aec}".to_string(), // Unicode
-                explicit_hash_key: None,
                 finalizers: EventFinalizers::default(),
                 metadata: RequestMetadata::default(),
             },
             UserRecord {
                 data: Bytes::from("record2"),
                 partition_key: "normalASCIIkey123".to_string(), // ASCII
-                explicit_hash_key: None,
                 finalizers: EventFinalizers::default(),
                 metadata: RequestMetadata::default(),
             },
