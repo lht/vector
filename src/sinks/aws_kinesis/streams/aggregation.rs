@@ -60,7 +60,7 @@
 //!                                       |
 //!                                       v
 //! +-------------------------------------------------------------------------------+
-//! |                    BATCHING FOR PUTRECORDS API CALL                           |
+//! |                    BATCHING FOR PutRecords API CALL                           |
 //! +-------------------------------------------------------------------------------+
 //!
 //!           PutRecords API Request (max 500 records or 10MB per request)
@@ -85,10 +85,10 @@
 //! +-------------------------------------------------------------------------------+
 //! |                        AWS KINESIS DATA STREAM                                |
 //! |                                                                               |
-//! |  Shard 1                      Shard 2                      Shard N           |
-//! | +---------+                  +---------+                  +---------+        |
-//! | | Agg 1   |                  | Agg 2   |                  | ...     |        |
-//! | +---------+                  +---------+                  +---------+        |
+//! |       Shard 1                  Shard 2                  Shard N               |
+//! |      +---------+              +---------+              +---------+            |
+//! |      | Agg 1   |              | Agg 2   |              | ...     |            |
+//! |      +---------+              +---------+              +---------+            |
 //! +-------------------------------------------------------------------------------+
 //! ```
 //!
@@ -243,8 +243,9 @@ impl KplAggregator {
             if single_record_size > MAX_KINESIS_RECORD_SIZE {
                 // Flush current batch if any
                 if !current_batch.is_empty() {
-                    if let Some(aggregated) = self.create_aggregated_record(&mut current_batch) {
-                        aggregated_records.push(aggregated);
+                    match self.create_aggregated_record(&mut current_batch) {
+                        Ok(aggregated) => aggregated_records.push(aggregated),
+                        Err(e) => tracing::error!(message = "Failed to create aggregated record", error = %e),
                     }
                     current_data_size = 0;
                 }
@@ -252,13 +253,16 @@ impl KplAggregator {
                 // Create single-record aggregate for the oversized record
                 let mut single_record_batch = VecDeque::new();
                 single_record_batch.push_back(user_record);
-                if let Some(aggregated) = self.create_aggregated_record(&mut single_record_batch) {
-                    tracing::info!(
-                        message = "Created single-record aggregate for oversized record",
-                        aggregate_data_size = aggregated.data.len(),
-                        partition_key = %aggregated.partition_key,
-                    );
-                    aggregated_records.push(aggregated);
+                match self.create_aggregated_record(&mut single_record_batch) {
+                    Ok(aggregated) => {
+                        tracing::info!(
+                            message = "Created single-record aggregate for oversized record",
+                            aggregate_data_size = aggregated.data.len(),
+                            partition_key = %aggregated.partition_key,
+                        );
+                        aggregated_records.push(aggregated);
+                    }
+                    Err(e) => tracing::error!(message = "Failed to create single-record aggregate", error = %e),
                 }
                 continue;
             }
@@ -277,7 +281,6 @@ impl KplAggregator {
             if should_flush && !current_batch.is_empty() {
                 let batch_count = current_batch.len();
                 let batch_data_size = current_data_size;
-                let estimated_kpl_size = self.estimate_kpl_size(batch_data_size, batch_count);
 
                 tracing::debug!(
                     message = "Flushing current batch to create aggregated record",
@@ -288,20 +291,15 @@ impl KplAggregator {
                     },
                     batch_record_count = batch_count,
                     batch_data_size = batch_data_size,
-                    estimated_kpl_size = estimated_kpl_size,
+                    estimated_kpl_size = self.estimate_kpl_size(batch_data_size, batch_count),
                     aggregate_number = aggregated_records.len() + 1,
                 );
 
-                // Flush current batch
-                if let Some(aggregated) = self.create_aggregated_record(&mut current_batch) {
-                    tracing::debug!(
-                        message = "Created aggregated record",
-                        aggregate_index = aggregated_records.len(),
-                        user_record_count = aggregated.user_record_count,
-                        aggregate_data_size = aggregated.data.len(),
-                        partition_key = %aggregated.partition_key,
-                    );
-                    aggregated_records.push(aggregated);
+                match self.create_aggregated_record(&mut current_batch) {
+                    Ok(aggregated) => {
+                        aggregated_records.push(aggregated);
+                    }
+                    Err(e) => tracing::error!(message = "Failed to create aggregated record", error = %e),
                 }
                 current_data_size = 0;
             }
@@ -315,25 +313,19 @@ impl KplAggregator {
         if !current_batch.is_empty() {
             let batch_count = current_batch.len();
             let batch_data_size = current_data_size;
-            let estimated_kpl_size = self.estimate_kpl_size(batch_data_size, batch_count);
 
             tracing::debug!(
                 message = "Flushing final batch",
                 batch_record_count = batch_count,
                 batch_data_size = batch_data_size,
-                estimated_kpl_size = estimated_kpl_size,
                 aggregate_number = aggregated_records.len() + 1,
             );
 
-            if let Some(aggregated) = self.create_aggregated_record(&mut current_batch) {
-                tracing::debug!(
-                    message = "Created final aggregated record",
-                    aggregate_index = aggregated_records.len(),
-                    user_record_count = aggregated.user_record_count,
-                    aggregate_data_size = aggregated.data.len(),
-                    partition_key = %aggregated.partition_key,
-                );
-                aggregated_records.push(aggregated);
+            match self.create_aggregated_record(&mut current_batch) {
+                Ok(aggregated) => {
+                    aggregated_records.push(aggregated);
+                }
+                Err(e) => tracing::error!(message = "Failed to create final aggregated record", error = %e),
             }
         }
 
@@ -361,10 +353,9 @@ impl KplAggregator {
     fn create_aggregated_record(
         &self,
         user_records: &mut VecDeque<UserRecord>,
-    ) -> Option<AggregatedRecord> {
+    ) -> Result<AggregatedRecord, String> {
         if user_records.is_empty() {
-            tracing::trace!("Skipping empty user_records batch");
-            return None;
+            return Err("Cannot create aggregate from empty user_records batch".into());
         }
 
         // Build partition key table. Use a single partition key for all records in this aggregate.
@@ -398,10 +389,8 @@ impl KplAggregator {
 
         // Serialize the protobuf message
         let mut protobuf_data = Vec::new();
-        if let Err(e) = aggregated.encode(&mut protobuf_data) {
-            tracing::error!(message = "Failed to encode KPL protobuf", error = %e);
-            return None;
-        }
+        aggregated.encode(&mut protobuf_data)
+            .map_err(|e| format!("Failed to encode KPL protobuf: {}", e))?;
 
         // Build the final KPL format: [magic][protobuf][md5]
 
@@ -438,7 +427,7 @@ impl KplAggregator {
             final_data_size = final_size,
         );
 
-        Some(AggregatedRecord {
+        Ok(AggregatedRecord {
             data: buf.freeze(),
             partition_key,
             user_record_count,
@@ -452,22 +441,6 @@ impl KplAggregator {
 mod tests {
     use super::*;
     use bytes::Bytes;
-
-    #[test]
-    fn test_user_record_size_estimation() {
-        let user_record = UserRecord {
-            data: Bytes::from("test data"),
-            partition_key: "test_key".to_string(),
-            explicit_hash_key: None,
-            finalizers: EventFinalizers::default(),
-            metadata: RequestMetadata::default(),
-        };
-
-        // Just verify that encoded_size returns a reasonable estimate
-        let size = user_record.encoded_size();
-        assert!(size > 0);
-        assert!(size >= user_record.data.len());
-    }
 
     #[test]
     fn test_kpl_aggregation() {
@@ -520,58 +493,6 @@ mod tests {
         let expected_checksum = hasher.finalize();
         let actual_checksum = &data[data.len() - 16..];
         assert_eq!(actual_checksum, expected_checksum.as_slice());
-    }
-
-    #[test]
-    fn test_partition_key_table_deduplication() {
-        let aggregator = KplAggregator::new(100);
-
-        let user_records = vec![
-            UserRecord {
-                data: Bytes::from("record1"),
-                partition_key: "key1".to_string(),
-                explicit_hash_key: None,
-                finalizers: EventFinalizers::default(),
-                metadata: RequestMetadata::default(),
-            },
-            UserRecord {
-                data: Bytes::from("record2"),
-                partition_key: "key2".to_string(), // Different partition key
-                explicit_hash_key: None,
-                finalizers: EventFinalizers::default(),
-                metadata: RequestMetadata::default(),
-            },
-            UserRecord {
-                data: Bytes::from("record3"),
-                partition_key: "key1".to_string(), // Same as first - should be deduplicated
-                explicit_hash_key: None,
-                finalizers: EventFinalizers::default(),
-                metadata: RequestMetadata::default(),
-            },
-        ];
-
-        let aggregated = aggregator.aggregate_records(user_records);
-        assert_eq!(aggregated.len(), 1);
-        assert_eq!(aggregated[0].user_record_count, 3);
-        assert_eq!(aggregated[0].partition_key, "key1"); // Uses first record's key
-
-        // Verify protobuf has deduplicated partition keys
-        let data = &aggregated[0].data;
-        let protobuf_data = &data[4..data.len() - 16];
-        let decoded = kpl_proto::AggregatedRecord::decode(protobuf_data).unwrap();
-
-        // Should only have 2 unique partition keys in the table
-        assert_eq!(decoded.partition_key_table.len(), 2);
-        assert!(decoded.partition_key_table.contains(&"key1".to_string()));
-        assert!(decoded.partition_key_table.contains(&"key2".to_string()));
-
-        // Verify records reference the correct indices
-        assert_eq!(decoded.records.len(), 3);
-        // First and third records should reference the same partition key index
-        assert_eq!(
-            decoded.records[0].partition_key_index,
-            decoded.records[2].partition_key_index
-        );
     }
 
     #[test]

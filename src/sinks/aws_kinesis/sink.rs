@@ -40,7 +40,7 @@ where
     S::Error: Debug + Into<crate::Error> + Send,
     R: Record + Send + Sync + Unpin + Clone + 'static,
 {
-    pub async fn run_inner(self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {
+    pub(crate) async fn run_inner(self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {
         let batch_settings = self.batch_settings;
 
         input
