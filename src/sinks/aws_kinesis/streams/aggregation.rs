@@ -160,6 +160,20 @@ pub mod kpl_proto {
 const KPL_MAGIC: [u8; 4] = [0xF3, 0x89, 0x9A, 0xC2];
 const MAX_AGGREGATE_SIZE: usize = 950_000; // 950KB binary data + overhead < 1MB AWS limit
 
+/// Generate a safe ASCII-only partition key for aggregated records.
+/// Uses alphanumeric characters to ensure compatibility with Java-based KCL consumers.
+fn generate_safe_partition_key() -> String {
+    use rand::Rng;
+    const CHARSET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let mut rng = rand::rng();
+    (0..16)
+        .map(|_| {
+            let idx = rng.random_range(0..CHARSET.len());
+            CHARSET[idx] as char
+        })
+        .collect()
+}
+
 /// Individual user record before aggregation
 #[derive(Debug, Clone)]
 pub struct UserRecord {
@@ -390,30 +404,25 @@ impl KplAggregator {
         );
 
         // Build partition key and explicit hash key tables
-        let mut partition_key_table: Vec<String> = Vec::new();
-        let mut partition_key_indices: HashMap<String, u64> = HashMap::new();
+        // Use a single generated ASCII partition key for all records in this aggregate.
+        // This matches the Golang KPL implementation and avoids Java UTF-16 issues.
+        let shared_partition_key = generate_safe_partition_key();
+        let partition_key_table: Vec<String> = vec![shared_partition_key.clone()];
         let mut explicit_hash_key_table: Vec<String> = Vec::new();
         let mut explicit_hash_key_indices: HashMap<String, u64> = HashMap::new();
+
+        tracing::trace!(
+            message = "Using shared partition key for all records in aggregate",
+            partition_key = %shared_partition_key,
+            record_count = user_records.len(),
+        );
 
         // Build protobuf records
         let mut proto_records = Vec::new();
 
         for (idx, user_record) in user_records.iter().enumerate() {
-            // Get or insert partition key
-            let pk_index = if let Some(&idx) = partition_key_indices.get(&user_record.partition_key)
-            {
-                idx
-            } else {
-                let idx = partition_key_table.len() as u64;
-                partition_key_table.push(user_record.partition_key.clone());
-                partition_key_indices.insert(user_record.partition_key.clone(), idx);
-                tracing::trace!(
-                    message = "Added new partition key to table",
-                    partition_key = %user_record.partition_key,
-                    table_index = idx,
-                );
-                idx
-            };
+            // All records use the same partition key (index 0)
+            let pk_index = 0u64;
 
             // Get or insert explicit hash key (if present)
             let ehk_index = if let Some(ref ehk) = user_record.explicit_hash_key {
@@ -518,7 +527,8 @@ impl KplAggregator {
         );
 
         // Collect metadata and finalizers
-        let partition_key = user_records.front()?.partition_key.clone();
+        // Use the same partition key we already generated for the protobuf
+        let partition_key = shared_partition_key;
         let user_record_count = user_records.len();
 
         let mut combined_finalizers = EventFinalizers::default();
@@ -712,5 +722,61 @@ mod tests {
 
         // Verify the aggregated record is under the size limit
         assert!(aggregated[0].data.len() < 1_000_000); // Under 1MB
+    }
+
+    #[test]
+    fn test_aggregated_partition_key_is_ascii() {
+        let aggregator = KplAggregator::new(100);
+
+        // Create records with various partition keys (Unicode, ASCII, etc.)
+        // The aggregated record should always use a generated ASCII key
+        let user_records = vec![
+            UserRecord {
+                data: Bytes::from("record1"),
+                partition_key: "\u{109ea2}\u{0c69dd}\u{076aec}".to_string(), // Unicode
+                explicit_hash_key: None,
+                finalizers: EventFinalizers::default(),
+                metadata: RequestMetadata::default(),
+            },
+            UserRecord {
+                data: Bytes::from("record2"),
+                partition_key: "normalASCIIkey123".to_string(), // ASCII
+                explicit_hash_key: None,
+                finalizers: EventFinalizers::default(),
+                metadata: RequestMetadata::default(),
+            },
+        ];
+
+        let aggregated = aggregator.aggregate_records(user_records);
+        assert_eq!(aggregated.len(), 1);
+
+        // The aggregated record's partition key should be ASCII alphanumeric
+        let partition_key = &aggregated[0].partition_key;
+
+        // Should be ASCII-only
+        assert!(partition_key.chars().all(|c| c.is_ascii()),
+            "Partition key should be ASCII-only, got: {}", partition_key);
+
+        // Should be alphanumeric
+        assert!(partition_key.chars().all(|c| c.is_ascii_alphanumeric()),
+            "Partition key should be alphanumeric, got: {}", partition_key);
+
+        // Should be 16 characters
+        assert_eq!(partition_key.len(), 16,
+            "Partition key should be 16 characters, got: {}", partition_key.len());
+
+        // Verify the protobuf has deduplicated partition keys
+        let data = &aggregated[0].data;
+        let protobuf_data = &data[4..data.len() - 16];
+        let decoded = kpl_proto::AggregatedRecord::decode(protobuf_data).unwrap();
+
+        // Since we now use a single generated key for all records in the aggregate,
+        // the partition key table should only have 1 entry
+        assert_eq!(decoded.partition_key_table.len(), 1,
+            "Partition key table should have exactly 1 entry (all records use same key)");
+
+        // All records should reference the same partition key index
+        assert!(decoded.records.iter().all(|r| r.partition_key_index == 0),
+            "All records should reference partition key index 0");
     }
 }
