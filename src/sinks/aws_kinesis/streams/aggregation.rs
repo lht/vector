@@ -126,7 +126,18 @@ pub mod kpl_proto {
 
 // KPL Magic bytes - identifies this as a KPL aggregated record
 const KPL_MAGIC: [u8; 4] = [0xF3, 0x89, 0x9A, 0xC2];
-const MAX_AGGREGATE_SIZE: usize = 950_000; // 950KB binary data + overhead < 1MB AWS limit
+
+// Maximum size for a Kinesis record (1 MiB)
+const MAX_KINESIS_RECORD_SIZE: usize = 1024 * 1024;
+
+// Fixed KPL overhead: magic (4) + MD5 (16)
+const KPL_FIXED_OVERHEAD: usize = 20;
+
+// Protobuf overhead per aggregated record: field tags, partition key table, etc.
+const PROTOBUF_BASE_OVERHEAD: usize = 100;
+
+// Protobuf overhead per user record: field tags, varint lengths
+const PROTOBUF_PER_RECORD_OVERHEAD: usize = 10;
 
 /// Individual user record before aggregation
 #[derive(Debug, Clone)]
@@ -199,20 +210,29 @@ impl Finalizable for AggregatedRecord {
 #[derive(Clone)]
 pub struct KplAggregator {
     max_records_per_aggregate: usize,
-    max_aggregate_size: usize,
 }
 
 impl KplAggregator {
     pub fn new(max_records_per_aggregate: usize) -> Self {
         Self {
             max_records_per_aggregate,
-            max_aggregate_size: MAX_AGGREGATE_SIZE,
         }
     }
 
     /// Returns the maximum number of records per aggregate
     pub fn max_records_per_aggregate(&self) -> usize {
         self.max_records_per_aggregate
+    }
+
+    /// Calculate the estimated final KPL record size including all overhead.
+    ///
+    /// This estimates the size of the final Kinesis record after KPL encoding,
+    /// including magic bytes, protobuf structure, and MD5 checksum.
+    fn estimate_kpl_size(&self, user_data_size: usize, record_count: usize) -> usize {
+        user_data_size
+            + KPL_FIXED_OVERHEAD
+            + PROTOBUF_BASE_OVERHEAD
+            + (PROTOBUF_PER_RECORD_OVERHEAD * record_count)
     }
 
     /// Aggregate a batch of user records into aggregated records
@@ -223,42 +243,25 @@ impl KplAggregator {
             message = "Starting KPL aggregation",
             input_records = total_input_records,
             max_records_per_aggregate = self.max_records_per_aggregate,
-            max_aggregate_size = self.max_aggregate_size,
+            max_kinesis_record_size = MAX_KINESIS_RECORD_SIZE,
         );
 
         let mut aggregated_records = Vec::new();
         let mut current_batch = VecDeque::new();
-        let mut current_size = 0;
+        let mut current_data_size = 0; // Total user data size (without overhead)
 
-        for (idx, user_record) in user_records.into_iter().enumerate() {
-            let record_size = user_record.encoded_size();
+        for user_record in user_records.into_iter() {
+            let record_data_size = user_record.data.len();
 
-            tracing::trace!(
-                message = "Processing user record",
-                record_index = idx,
-                record_size = record_size,
-                partition_key = %user_record.partition_key,
-                explicit_hash_key = ?user_record.explicit_hash_key,
-                current_batch_size = current_batch.len(),
-                current_size_bytes = current_size,
-            );
-
-            // Handle records that are too large to fit in an aggregate with other records
-            if record_size > self.max_aggregate_size {
-                tracing::warn!(
-                    message = "Record exceeds max aggregate size, sending as single-record aggregate",
-                    record_index = idx,
-                    record_size = record_size,
-                    max_aggregate_size = self.max_aggregate_size,
-                    partition_key = %user_record.partition_key,
-                );
-
+            // Handle records that would exceed Kinesis limit even as single-record aggregate
+            let single_record_size = self.estimate_kpl_size(record_data_size, 1);
+            if single_record_size > MAX_KINESIS_RECORD_SIZE {
                 // Flush current batch if any
                 if !current_batch.is_empty() {
                     if let Some(aggregated) = self.create_aggregated_record(&mut current_batch) {
                         aggregated_records.push(aggregated);
                     }
-                    current_size = 0;
+                    current_data_size = 0;
                 }
 
                 // Create single-record aggregate for the oversized record
@@ -275,23 +278,32 @@ impl KplAggregator {
                 continue;
             }
 
-            // Check if we should start a new aggregate
-            let should_flush = current_batch.len() >= self.max_records_per_aggregate
-                || current_size + record_size > self.max_aggregate_size;
+            // Calculate what the final KPL size would be if we add this record
+            let estimated_size_with_record = self.estimate_kpl_size(
+                current_data_size + record_data_size,
+                current_batch.len() + 1,
+            );
+
+            // Check if adding this record would exceed limits
+            let would_exceed_record_count = current_batch.len() >= self.max_records_per_aggregate;
+            let would_exceed_size = estimated_size_with_record > MAX_KINESIS_RECORD_SIZE;
+            let should_flush = would_exceed_record_count || would_exceed_size;
 
             if should_flush && !current_batch.is_empty() {
                 let batch_count = current_batch.len();
-                let batch_size = current_size;
+                let batch_data_size = current_data_size;
+                let estimated_kpl_size = self.estimate_kpl_size(batch_data_size, batch_count);
 
                 tracing::debug!(
                     message = "Flushing current batch to create aggregated record",
-                    reason = if current_batch.len() >= self.max_records_per_aggregate {
+                    reason = if would_exceed_record_count {
                         "max_records_reached"
                     } else {
                         "size_limit_reached"
                     },
                     batch_record_count = batch_count,
-                    batch_size_bytes = batch_size,
+                    batch_data_size = batch_data_size,
+                    estimated_kpl_size = estimated_kpl_size,
                     aggregate_number = aggregated_records.len() + 1,
                 );
 
@@ -306,23 +318,25 @@ impl KplAggregator {
                     );
                     aggregated_records.push(aggregated);
                 }
-                current_size = 0;
+                current_data_size = 0;
             }
 
             // Add record to current batch
-            current_size += record_size;
+            current_data_size += record_data_size;
             current_batch.push_back(user_record);
         }
 
         // Flush remaining records
         if !current_batch.is_empty() {
             let batch_count = current_batch.len();
-            let batch_size = current_size;
+            let batch_data_size = current_data_size;
+            let estimated_kpl_size = self.estimate_kpl_size(batch_data_size, batch_count);
 
             tracing::debug!(
                 message = "Flushing final batch",
                 batch_record_count = batch_count,
-                batch_size_bytes = batch_size,
+                batch_data_size = batch_data_size,
+                estimated_kpl_size = estimated_kpl_size,
                 aggregate_number = aggregated_records.len() + 1,
             );
 
@@ -368,43 +382,20 @@ impl KplAggregator {
             return None;
         }
 
-        let record_count = user_records.len();
-        tracing::trace!(
-            message = "Building KPL protobuf structure",
-            user_record_count = record_count,
-        );
-
-        // Build partition key table
-        // Use a single partition key for all records in this aggregate.
-        // This matches the Golang KPL implementation: all records in an aggregate
-        // share the same partition key, which ensures the aggregated record is
-        // correctly associated with the Kinesis shard it arrives through.
+        // Build partition key table. Use a single partition key for all records in this aggregate.
+        // All records in an aggregate share the same partition key, which ensures the aggregated
+        // record is correctly associated with the Kinesis shard it arrives through.
         //
-        // Note: We do NOT populate explicit_hash_key_table, matching Golang's behavior.
-        // Explicit hash keys in subrecords are meaningless since shard assignment already
-        // happened at the aggregated record level.
+        // Note: We do NOT populate explicit_hash_key_table. Explicit hash keys in subrecords are
+        // meaningless since shard assignment already happened at the aggregated record level.
         let shared_partition_key = crate::sinks::aws_kinesis::sink::gen_partition_key();
         let partition_key_table: Vec<String> = vec![shared_partition_key.clone()];
-
-        tracing::trace!(
-            message = "Using shared partition key for all records in aggregate",
-            partition_key = %shared_partition_key,
-            record_count = user_records.len(),
-        );
 
         // Build protobuf records
         let mut proto_records = Vec::new();
 
-        for (idx, user_record) in user_records.iter().enumerate() {
+        for user_record in user_records.iter() {
             // All records use the same partition key (index 0)
-            // Explicit hash key is not set (matching Golang implementation)
-            tracing::trace!(
-                message = "Adding user record to protobuf",
-                proto_record_index = idx,
-                partition_key_index = 0,
-                data_size = user_record.data.len(),
-            );
-
             proto_records.push(kpl_proto::Record {
                 partition_key_index: 0,
                 explicit_hash_key_index: None,
@@ -413,14 +404,7 @@ impl KplAggregator {
             });
         }
 
-        tracing::debug!(
-            message = "Built KPL protobuf structure",
-            partition_key_table_size = partition_key_table.len(),
-            proto_records_count = proto_records.len(),
-        );
-
         // Create the aggregated record protobuf message
-        // Note: explicit_hash_key_table is left empty, matching Golang implementation
         let aggregated = kpl_proto::AggregatedRecord {
             partition_key_table: partition_key_table.clone(),
             explicit_hash_key_table: vec![],
@@ -430,54 +414,21 @@ impl KplAggregator {
         // Serialize the protobuf message
         let mut protobuf_data = Vec::new();
         if let Err(e) = aggregated.encode(&mut protobuf_data) {
-            tracing::error!(
-                message = "Failed to encode KPL protobuf",
-                error = %e,
-            );
+            tracing::error!(message = "Failed to encode KPL protobuf", error = %e);
             return None;
         }
 
-        let protobuf_size = protobuf_data.len();
-        tracing::trace!(
-            message = "Encoded protobuf data",
-            protobuf_size = protobuf_size,
-        );
-
         // Build the final KPL format: [magic][protobuf][md5]
-        let mut buf = BytesMut::with_capacity(4 + protobuf_data.len() + 16);
 
-        // Write KPL magic
-        buf.put_slice(&KPL_MAGIC);
-        tracing::trace!(
-            message = "Added KPL magic bytes",
-            magic_hex = format!(
-                "{:02x}{:02x}{:02x}{:02x}",
-                KPL_MAGIC[0], KPL_MAGIC[1], KPL_MAGIC[2], KPL_MAGIC[3]
-            ),
-        );
-
-        // Write protobuf data
-        buf.put_slice(&protobuf_data);
-
-        // Calculate and write MD5 checksum of the protobuf data only
+        // Calculate MD5 checksum of the protobuf data only
         let mut hasher = Md5::new();
         hasher.update(&protobuf_data);
         let checksum = hasher.finalize();
+
+        let mut buf = BytesMut::with_capacity(KPL_MAGIC.len() + protobuf_data.len() + checksum.len());
+        buf.put_slice(&KPL_MAGIC);
+        buf.put_slice(&protobuf_data);
         buf.put_slice(&checksum);
-
-        tracing::trace!(
-            message = "Added MD5 checksum",
-            checksum_hex = format!("{:x}", checksum),
-        );
-
-        let final_size = buf.len();
-        tracing::debug!(
-            message = "Built final KPL aggregated record",
-            total_size = final_size,
-            magic_size = 4,
-            protobuf_size = protobuf_size,
-            checksum_size = 16,
-        );
 
         // Collect metadata and finalizers
         // Use the same partition key we already generated for the protobuf
@@ -494,6 +445,7 @@ impl KplAggregator {
 
         let combined_metadata = RequestMetadata::from_batch(metadata_builders);
 
+        let final_size = buf.len();
         tracing::debug!(
             message = "Finalized aggregated record",
             partition_key = %partition_key,
