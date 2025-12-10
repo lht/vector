@@ -117,7 +117,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use md5::{Digest, Md5};
 use prost::Message;
 use std::collections::VecDeque;
-use vector_lib::{ByteSizeOf, request_metadata::RequestMetadata};
+use vector_lib::request_metadata::RequestMetadata;
 
 // Include the generated protobuf code
 pub mod kpl_proto {
@@ -133,11 +133,18 @@ const MAX_KINESIS_RECORD_SIZE: usize = 1024 * 1024;
 // Fixed KPL overhead: magic (4) + MD5 (16)
 const KPL_FIXED_OVERHEAD: usize = 20;
 
-// Protobuf overhead per aggregated record: field tags, partition key table, etc.
-const PROTOBUF_BASE_OVERHEAD: usize = 100;
+// Protobuf base overhead per aggregated record:
+//   - partition_key_table: 1 key (16 chars × 4 bytes Unicode = 64) + encoding (2) = 66 bytes
+//   - explicit_hash_key_table: empty, just encoding = 2 bytes
+//   - Total: 68 bytes, rounded to 80 for safety buffer
+const PROTOBUF_BASE_OVERHEAD: usize = 80;
 
-// Protobuf overhead per user record: field tags, varint lengths
-const PROTOBUF_PER_RECORD_OVERHEAD: usize = 10;
+// Protobuf overhead per user record:
+//   - Record wrapper: ~2 bytes
+//   - partition_key_index field: 2 bytes (always 0)
+//   - data field encoding: ~2 bytes
+//   - Total: 6 bytes, rounded to 8 for safety buffer
+const PROTOBUF_PER_RECORD_OVERHEAD: usize = 8;
 
 /// Individual user record before aggregation
 #[derive(Debug, Clone)]
@@ -158,30 +165,15 @@ impl UserRecord {
     /// Calculate the estimated encoded size of this record in protobuf format.
     /// This is an approximation used for buffer size calculations.
     pub fn encoded_size(&self) -> usize {
-        // Approximate protobuf overhead: field tags, lengths, etc.
-        // partition_key_index field (varint) + data field + tags
-        self.data.len()
-            + self.partition_key.len()
-            + self.explicit_hash_key.as_ref().map_or(0, |k| k.len())
-            + 20 // overhead estimate
+        // Note: explicit_hash_key is NOT encoded in KPL protobuf (always set to None)
+        // Only the data is encoded in the protobuf, plus minimal overhead
+        self.data.len() + 20 // data + overhead estimate
     }
 }
 
 impl Finalizable for UserRecord {
     fn take_finalizers(&mut self) -> EventFinalizers {
         std::mem::take(&mut self.finalizers)
-    }
-}
-
-impl ByteSizeOf for UserRecord {
-    fn size_of(&self) -> usize {
-        self.encoded_size()
-    }
-
-    fn allocated_bytes(&self) -> usize {
-        self.data.len()
-            + self.partition_key.len()
-            + self.explicit_hash_key.as_ref().map_or(0, |k| k.len())
     }
 }
 
@@ -239,13 +231,6 @@ impl KplAggregator {
     /// Uses the first record's partition key for the entire aggregate
     pub fn aggregate_records(&self, user_records: Vec<UserRecord>) -> Vec<AggregatedRecord> {
         let total_input_records = user_records.len();
-        tracing::debug!(
-            message = "Starting KPL aggregation",
-            input_records = total_input_records,
-            max_records_per_aggregate = self.max_records_per_aggregate,
-            max_kinesis_record_size = MAX_KINESIS_RECORD_SIZE,
-        );
-
         let mut aggregated_records = Vec::new();
         let mut current_batch = VecDeque::new();
         let mut current_data_size = 0; // Total user data size (without overhead)
