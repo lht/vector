@@ -160,18 +160,16 @@ pub mod kpl_proto {
 const KPL_MAGIC: [u8; 4] = [0xF3, 0x89, 0x9A, 0xC2];
 const MAX_AGGREGATE_SIZE: usize = 950_000; // 950KB binary data + overhead < 1MB AWS limit
 
-/// Generate a safe ASCII-only partition key for aggregated records.
-/// Uses alphanumeric characters to ensure compatibility with Java-based KCL consumers.
-fn generate_safe_partition_key() -> String {
-    use rand::Rng;
-    const CHARSET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-    let mut rng = rand::rng();
-    (0..16)
-        .map(|_| {
-            let idx = rng.random_range(0..CHARSET.len());
-            CHARSET[idx] as char
+/// Generate a random partition key for aggregated records.
+/// This uses the same random generation as the non-aggregated path.
+fn generate_partition_key() -> String {
+    use rand::random;
+    random::<[char; 16]>()
+        .iter()
+        .fold(String::new(), |mut s, c| {
+            s.push(*c);
+            s
         })
-        .collect()
 }
 
 /// Individual user record before aggregation
@@ -404,9 +402,11 @@ impl KplAggregator {
         );
 
         // Build partition key and explicit hash key tables
-        // Use a single generated ASCII partition key for all records in this aggregate.
-        // This matches the Golang KPL implementation and avoids Java UTF-16 issues.
-        let shared_partition_key = generate_safe_partition_key();
+        // Use a single partition key for all records in this aggregate.
+        // This matches the Golang KPL implementation: all records in an aggregate
+        // share the same partition key, which saves space in the protobuf and
+        // ensures all records are treated as a cohesive unit.
+        let shared_partition_key = generate_partition_key();
         let partition_key_table: Vec<String> = vec![shared_partition_key.clone()];
         let mut explicit_hash_key_table: Vec<String> = Vec::new();
         let mut explicit_hash_key_indices: HashMap<String, u64> = HashMap::new();
@@ -725,11 +725,11 @@ mod tests {
     }
 
     #[test]
-    fn test_aggregated_partition_key_is_ascii() {
+    fn test_shared_partition_key_in_aggregate() {
         let aggregator = KplAggregator::new(100);
 
         // Create records with various partition keys (Unicode, ASCII, etc.)
-        // The aggregated record should always use a generated ASCII key
+        // The aggregated record will use a single generated key for all records
         let user_records = vec![
             UserRecord {
                 data: Bytes::from("record1"),
@@ -750,22 +750,12 @@ mod tests {
         let aggregated = aggregator.aggregate_records(user_records);
         assert_eq!(aggregated.len(), 1);
 
-        // The aggregated record's partition key should be ASCII alphanumeric
+        // The aggregated record should have a partition key (16 random characters)
         let partition_key = &aggregated[0].partition_key;
-
-        // Should be ASCII-only
-        assert!(partition_key.chars().all(|c| c.is_ascii()),
-            "Partition key should be ASCII-only, got: {}", partition_key);
-
-        // Should be alphanumeric
-        assert!(partition_key.chars().all(|c| c.is_ascii_alphanumeric()),
-            "Partition key should be alphanumeric, got: {}", partition_key);
-
-        // Should be 16 characters
         assert_eq!(partition_key.len(), 16,
             "Partition key should be 16 characters, got: {}", partition_key.len());
 
-        // Verify the protobuf has deduplicated partition keys
+        // Verify the protobuf has only ONE partition key (shared by all records)
         let data = &aggregated[0].data;
         let protobuf_data = &data[4..data.len() - 16];
         let decoded = kpl_proto::AggregatedRecord::decode(protobuf_data).unwrap();
@@ -775,7 +765,7 @@ mod tests {
         assert_eq!(decoded.partition_key_table.len(), 1,
             "Partition key table should have exactly 1 entry (all records use same key)");
 
-        // All records should reference the same partition key index
+        // All records should reference the same partition key index (0)
         assert!(decoded.records.iter().all(|r| r.partition_key_index == 0),
             "All records should reference partition key index 0");
     }
