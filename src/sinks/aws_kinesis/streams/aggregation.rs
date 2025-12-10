@@ -250,21 +250,41 @@ impl KplAggregator {
     /// Aggregate a batch of user records into aggregated records
     /// Uses the first record's partition key for the entire aggregate
     pub fn aggregate_records(&self, user_records: Vec<UserRecord>) -> Vec<AggregatedRecord> {
+        let total_input_records = user_records.len();
+        tracing::debug!(
+            message = "Starting KPL aggregation",
+            input_records = total_input_records,
+            max_records_per_aggregate = self.max_records_per_aggregate,
+            max_aggregate_size = self.max_aggregate_size,
+        );
+
         let mut aggregated_records = Vec::new();
         let mut current_batch = VecDeque::new();
         let mut current_size = 0;
+        let mut skipped_oversized = 0;
 
-        for user_record in user_records {
+        for (idx, user_record) in user_records.into_iter().enumerate() {
             let record_size = user_record.encoded_size();
+
+            tracing::trace!(
+                message = "Processing user record",
+                record_index = idx,
+                record_size = record_size,
+                partition_key = %user_record.partition_key,
+                explicit_hash_key = ?user_record.explicit_hash_key,
+                current_batch_size = current_batch.len(),
+                current_size_bytes = current_size,
+            );
 
             // Safety check: Skip records that are too large for any aggregate
             if record_size > self.max_aggregate_size {
-                // FIXME: remove logging. How to handle large event?
-                eprintln!(
-                    "Warning: Skipping user record that is too large for aggregation. \
-                     Record size: {} bytes, limit: {} bytes. \
-                     Consider reducing compression ratio or disabling aggregation for large records.",
-                    record_size, self.max_aggregate_size
+                skipped_oversized += 1;
+                tracing::warn!(
+                    message = "Skipping oversized user record",
+                    record_index = idx,
+                    record_size = record_size,
+                    max_aggregate_size = self.max_aggregate_size,
+                    partition_key = %user_record.partition_key,
                 );
                 continue;
             }
@@ -274,8 +294,30 @@ impl KplAggregator {
                 || current_size + record_size > self.max_aggregate_size;
 
             if should_flush && !current_batch.is_empty() {
+                let batch_count = current_batch.len();
+                let batch_size = current_size;
+
+                tracing::debug!(
+                    message = "Flushing current batch to create aggregated record",
+                    reason = if current_batch.len() >= self.max_records_per_aggregate {
+                        "max_records_reached"
+                    } else {
+                        "size_limit_reached"
+                    },
+                    batch_record_count = batch_count,
+                    batch_size_bytes = batch_size,
+                    aggregate_number = aggregated_records.len() + 1,
+                );
+
                 // Flush current batch
                 if let Some(aggregated) = self.create_aggregated_record(&mut current_batch) {
+                    tracing::debug!(
+                        message = "Created aggregated record",
+                        aggregate_index = aggregated_records.len(),
+                        user_record_count = aggregated.user_record_count,
+                        aggregate_data_size = aggregated.data.len(),
+                        partition_key = %aggregated.partition_key,
+                    );
                     aggregated_records.push(aggregated);
                 }
                 current_size = 0;
@@ -288,10 +330,45 @@ impl KplAggregator {
 
         // Flush remaining records
         if !current_batch.is_empty() {
+            let batch_count = current_batch.len();
+            let batch_size = current_size;
+
+            tracing::debug!(
+                message = "Flushing final batch",
+                batch_record_count = batch_count,
+                batch_size_bytes = batch_size,
+                aggregate_number = aggregated_records.len() + 1,
+            );
+
             if let Some(aggregated) = self.create_aggregated_record(&mut current_batch) {
+                tracing::debug!(
+                    message = "Created final aggregated record",
+                    aggregate_index = aggregated_records.len(),
+                    user_record_count = aggregated.user_record_count,
+                    aggregate_data_size = aggregated.data.len(),
+                    partition_key = %aggregated.partition_key,
+                );
                 aggregated_records.push(aggregated);
             }
         }
+
+        let total_output_records = aggregated_records.len();
+        let total_user_records: usize =
+            aggregated_records.iter().map(|r| r.user_record_count).sum();
+        let aggregation_ratio = if total_output_records > 0 {
+            total_input_records as f64 / total_output_records as f64
+        } else {
+            0.0
+        };
+
+        tracing::info!(
+            message = "KPL aggregation complete",
+            input_records = total_input_records,
+            output_aggregated_records = total_output_records,
+            total_user_records_in_aggregates = total_user_records,
+            skipped_oversized_records = skipped_oversized,
+            aggregation_ratio = %format!("{:.2}", aggregation_ratio),
+        );
 
         aggregated_records
     }
@@ -302,8 +379,15 @@ impl KplAggregator {
         user_records: &mut VecDeque<UserRecord>,
     ) -> Option<AggregatedRecord> {
         if user_records.is_empty() {
+            tracing::trace!("Skipping empty user_records batch");
             return None;
         }
+
+        let record_count = user_records.len();
+        tracing::trace!(
+            message = "Building KPL protobuf structure",
+            user_record_count = record_count,
+        );
 
         // Build partition key and explicit hash key tables
         let mut partition_key_table: Vec<String> = Vec::new();
@@ -314,7 +398,7 @@ impl KplAggregator {
         // Build protobuf records
         let mut proto_records = Vec::new();
 
-        for user_record in user_records.iter() {
+        for (idx, user_record) in user_records.iter().enumerate() {
             // Get or insert partition key
             let pk_index = if let Some(&idx) = partition_key_indices.get(&user_record.partition_key)
             {
@@ -323,6 +407,11 @@ impl KplAggregator {
                 let idx = partition_key_table.len() as u64;
                 partition_key_table.push(user_record.partition_key.clone());
                 partition_key_indices.insert(user_record.partition_key.clone(), idx);
+                tracing::trace!(
+                    message = "Added new partition key to table",
+                    partition_key = %user_record.partition_key,
+                    table_index = idx,
+                );
                 idx
             };
 
@@ -334,12 +423,25 @@ impl KplAggregator {
                     let idx = explicit_hash_key_table.len() as u64;
                     explicit_hash_key_table.push(ehk.clone());
                     explicit_hash_key_indices.insert(ehk.clone(), idx);
+                    tracing::trace!(
+                        message = "Added new explicit hash key to table",
+                        explicit_hash_key = %ehk,
+                        table_index = idx,
+                    );
                     idx
                 };
                 Some(idx)
             } else {
                 None
             };
+
+            tracing::trace!(
+                message = "Adding user record to protobuf",
+                proto_record_index = idx,
+                partition_key_index = pk_index,
+                explicit_hash_key_index = ?ehk_index,
+                data_size = user_record.data.len(),
+            );
 
             proto_records.push(kpl_proto::Record {
                 partition_key_index: pk_index,
@@ -349,25 +451,48 @@ impl KplAggregator {
             });
         }
 
+        tracing::debug!(
+            message = "Built KPL protobuf structure",
+            partition_key_table_size = partition_key_table.len(),
+            explicit_hash_key_table_size = explicit_hash_key_table.len(),
+            proto_records_count = proto_records.len(),
+        );
+
         // Create the aggregated record protobuf message
         let aggregated = kpl_proto::AggregatedRecord {
-            partition_key_table,
-            explicit_hash_key_table,
+            partition_key_table: partition_key_table.clone(),
+            explicit_hash_key_table: explicit_hash_key_table.clone(),
             records: proto_records,
         };
 
         // Serialize the protobuf message
         let mut protobuf_data = Vec::new();
         if let Err(e) = aggregated.encode(&mut protobuf_data) {
-            eprintln!("Error encoding protobuf: {}", e);
+            tracing::error!(
+                message = "Failed to encode KPL protobuf",
+                error = %e,
+            );
             return None;
         }
+
+        let protobuf_size = protobuf_data.len();
+        tracing::trace!(
+            message = "Encoded protobuf data",
+            protobuf_size = protobuf_size,
+        );
 
         // Build the final KPL format: [magic][protobuf][md5]
         let mut buf = BytesMut::with_capacity(4 + protobuf_data.len() + 16);
 
         // Write KPL magic
         buf.put_slice(&KPL_MAGIC);
+        tracing::trace!(
+            message = "Added KPL magic bytes",
+            magic_hex = format!(
+                "{:02x}{:02x}{:02x}{:02x}",
+                KPL_MAGIC[0], KPL_MAGIC[1], KPL_MAGIC[2], KPL_MAGIC[3]
+            ),
+        );
 
         // Write protobuf data
         buf.put_slice(&protobuf_data);
@@ -377,6 +502,20 @@ impl KplAggregator {
         hasher.update(&protobuf_data);
         let checksum = hasher.finalize();
         buf.put_slice(&checksum);
+
+        tracing::trace!(
+            message = "Added MD5 checksum",
+            checksum_hex = format!("{:x}", checksum),
+        );
+
+        let final_size = buf.len();
+        tracing::debug!(
+            message = "Built final KPL aggregated record",
+            total_size = final_size,
+            magic_size = 4,
+            protobuf_size = protobuf_size,
+            checksum_size = 16,
+        );
 
         // Collect metadata and finalizers
         let partition_key = user_records.front()?.partition_key.clone();
@@ -391,6 +530,13 @@ impl KplAggregator {
         }
 
         let combined_metadata = RequestMetadata::from_batch(metadata_builders);
+
+        tracing::debug!(
+            message = "Finalized aggregated record",
+            partition_key = %partition_key,
+            user_record_count = user_record_count,
+            final_data_size = final_size,
+        );
 
         Some(AggregatedRecord {
             data: buf.freeze(),
