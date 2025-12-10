@@ -229,7 +229,6 @@ impl KplAggregator {
         let mut aggregated_records = Vec::new();
         let mut current_batch = VecDeque::new();
         let mut current_size = 0;
-        let mut skipped_oversized = 0;
 
         for (idx, user_record) in user_records.into_iter().enumerate() {
             let record_size = user_record.encoded_size();
@@ -244,16 +243,35 @@ impl KplAggregator {
                 current_size_bytes = current_size,
             );
 
-            // Safety check: Skip records that are too large for any aggregate
+            // Handle records that are too large to fit in an aggregate with other records
             if record_size > self.max_aggregate_size {
-                skipped_oversized += 1;
                 tracing::warn!(
-                    message = "Skipping oversized user record",
+                    message = "Record exceeds max aggregate size, sending as single-record aggregate",
                     record_index = idx,
                     record_size = record_size,
                     max_aggregate_size = self.max_aggregate_size,
                     partition_key = %user_record.partition_key,
                 );
+
+                // Flush current batch if any
+                if !current_batch.is_empty() {
+                    if let Some(aggregated) = self.create_aggregated_record(&mut current_batch) {
+                        aggregated_records.push(aggregated);
+                    }
+                    current_size = 0;
+                }
+
+                // Create single-record aggregate for the oversized record
+                let mut single_record_batch = VecDeque::new();
+                single_record_batch.push_back(user_record);
+                if let Some(aggregated) = self.create_aggregated_record(&mut single_record_batch) {
+                    tracing::info!(
+                        message = "Created single-record aggregate for oversized record",
+                        aggregate_data_size = aggregated.data.len(),
+                        partition_key = %aggregated.partition_key,
+                    );
+                    aggregated_records.push(aggregated);
+                }
                 continue;
             }
 
@@ -334,7 +352,6 @@ impl KplAggregator {
             input_records = total_input_records,
             output_aggregated_records = total_output_records,
             total_user_records_in_aggregates = total_user_records,
-            skipped_oversized_records = skipped_oversized,
             aggregation_ratio = %format!("{:.2}", aggregation_ratio),
         );
 
@@ -621,7 +638,7 @@ mod tests {
     }
 
     #[test]
-    fn test_oversized_record_safety_check() {
+    fn test_oversized_record_handling() {
         let aggregator = KplAggregator::new(100);
 
         // Create a record that's too large (> 950KB limit)
@@ -652,12 +669,21 @@ mod tests {
 
         let aggregated = aggregator.aggregate_records(user_records);
 
-        // Should create one aggregate with only the normal records (large record skipped)
-        assert_eq!(aggregated.len(), 1);
-        assert_eq!(aggregated[0].user_record_count, 2); // Only 2 records (large one skipped)
+        // Should create three aggregates:
+        // 1. First normal record
+        // 2. Oversized record as single-record aggregate
+        // 3. Second normal record
+        assert_eq!(aggregated.len(), 3);
 
-        // Verify the aggregated record is under the size limit
-        assert!(aggregated[0].data.len() < 1_000_000); // Under 1MB
+        // First aggregate: normal record
+        assert_eq!(aggregated[0].user_record_count, 1);
+
+        // Second aggregate: oversized record sent as single-record aggregate
+        assert_eq!(aggregated[1].user_record_count, 1);
+        assert!(aggregated[1].data.len() > 1_000_000); // Large aggregate
+
+        // Third aggregate: another normal record
+        assert_eq!(aggregated[2].user_record_count, 1);
     }
 
     #[test]
