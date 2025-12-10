@@ -14,8 +14,7 @@
 //!   UserRecord 1          UserRecord 2          UserRecord 3          UserRecord 4
 //! +--------------+      +--------------+      +--------------+      +--------------+
 //! | Data: "..."  |      | Data: "..."  |      | Data: "..."  |      | Data: "..."  |
-//! | PKey: "A"    |      | PKey: "A"    |      | PKey: "B"    |      | PKey: "B"    |
-//! | EHKey: null  |      | EHKey: "X"   |      | EHKey: null  |      | EHKey: "Y"   |
+//! | PKey: "user1"|      | PKey: "user2"|      | PKey: "user3"|      | PKey: "user4"|
 //! +--------------+      +--------------+      +--------------+      +--------------+
 //!        |                     |                     |                     |
 //!        +----------+----------+                     +----------+----------+
@@ -25,118 +24,87 @@
 //! |                        AGGREGATED RECORDS (KPL Format)                        |
 //! +-------------------------------------------------------------------------------+
 //!
-//!     Aggregated Record 1                          Aggregated Record 2
-//! +----------------------------+              +----------------------------+
-//! | +--------+                 |              | +--------+                 |
-//! | | Magic  | (4 bytes)       |              | | Magic  | (4 bytes)       |
-//! | |0xF3899AC2                |              | |0xF3899AC2                |
-//! | +--------+                 |              | +--------+                 |
-//! | +----------------------+   |              | +----------------------+   |
-//! | |   Protobuf Message   |   |              | |   Protobuf Message   |   |
-//! | | +------------------+ |   |              | | +------------------+ |   |
-//! | | |partition_key     | |   |              | | |partition_key     | |   |
-//! | | |  _table ["A"]    | |   |              | | |  _table ["B"]    | |   |
-//! | | +------------------+ |   |              | | +------------------+ |   |
-//! | | +------------------+ |   |              | | +------------------+ |   |
-//! | | |explicit_hash_key | |   |              | | |explicit_hash_key | |   |
-//! | | |  _table ["X"]    | |   |              | | |  _table ["Y"]    | |   |
-//! | | +------------------+ |   |              | | +------------------+ |   |
-//! | | +------------------+ |   |              | | +------------------+ |   |
-//! | | | records[]        | |   |              | | | records[]        | |   |
-//! | | |  Record 1:       | |   |              | | |  Record 3:       | |   |
-//! | | |   pk_index: 0    | |   |              | | |   pk_index: 0    | |   |
-//! | | |   ehk_index: -   | |   |              | | |   ehk_index: -   | |   |
-//! | | |   data: "..."    | |   |              | | |   data: "..."    | |   |
-//! | | |  Record 2:       | |   |              | | |  Record 4:       | |   |
-//! | | |   pk_index: 0    | |   |              | | |   pk_index: 0    | |   |
-//! | | |   ehk_index: 0   | |   |              | | |   ehk_index: 0   | |   |
-//! | | |   data: "..."    | |   |              | | |   data: "..."    | |   |
-//! | | +------------------+ |   |              | | +------------------+ |   |
-//! | +----------------------+   |              | +----------------------+   |
-//! | +--------+                 |              | +--------+                 |
-//! | |MD5 Sum | (16 bytes)      |              | |MD5 Sum | (16 bytes)      |
-//! | |of Proto|                 |              | |of Proto|                 |
-//! | +--------+                 |              | +--------+                 |
-//! |                            |              |                            |
-//! | Partition Key: "A"         |              | Partition Key: "B"         |
-//! | User Record Count: 2       |              | User Record Count: 2       |
-//! | Size: ~950KB max           |              | Size: ~950KB max           |
-//! +----------------------------+              +----------------------------+
-//!        |                                            |
-//!        +------------------+--------------------------+
-//!                           |
-//!                           v
+//!         Aggregated Record 1                         Aggregated Record 2
+//!     +----------------------------+             +----------------------------+
+//!     | +------------------------+ |             | +------------------------+ |
+//!     | |  Magic   (4 bytes)     | |             | |  Magic   (4 bytes)     | |
+//!     | |     0xF3899AC2         | |             | |     0xF3899AC2         | |
+//!     | +------------------------+ |             | +------------------------+ |
+//!     | +------------------------+ |             | +------------------------+ |
+//!     | |   Protobuf Message     | |             | |   Protobuf Message     | |
+//!     | | +--------------------+ | |             | | +--------------------+ | |
+//!     | | |partition_key_table | | |             | | |partition_key_table | | |
+//!     | | |  ["key_abc123"]    | | |             | | |  ["key_abc789"]    | | |
+//!     | | +--------------------+ | |             | | +--------------------+ | |
+//!     | | +--------------------+ | |             | | +--------------------+ | |
+//!     | | | records[]          | | |             | | | records[]          | | |
+//!     | | |  Record 1:         | | |             | | |  Record 3:         | | |
+//!     | | |   pk_index: 0      | | |             | | |   pk_index: 0      | | |
+//!     | | |   data: "..."      | | |             | | |   data: "..."      | | |
+//!     | | |  Record 2:         | | |             | | |  Record 4:         | | |
+//!     | | |   pk_index: 0      | | |             | | |   pk_index: 0      | | |
+//!     | | |   data: "..."      | | |             | | |   data: "..."      | | |
+//!     | | +--------------------+ | |             | | +--------------------+ | |
+//!     | +------------------------+ |             | +------------------------+ |
+//!     | +----------------------+   |             | +----------------------+   |
+//!     | | MD5 Sum of protobuf  |   |             | | MD5 Sum of protobuf  |   |
+//!     | |     (16 bytes)       |   |             | |     (16 bytes)       |   |
+//!     | +----------------------+   |             | +----------------------+   |
+//!     |                            |             |                            |
+//!     | Partition Key: "key_abc123"|             | Partition Key: "key_abc789"|
+//!     | User Record Count: 2       |             | User Record Count: 2       |
+//!     | Size: ~950KB max           |             | Size: ~950KB max           |
+//!     +----------------------------+             +----------------------------+
+//!            |                                             |
+//!            +------------------+--------------------------+
+//!                                       |
+//!                                       v
 //! +-------------------------------------------------------------------------------+
 //! |                    BATCHING FOR PUTRECORDS API CALL                           |
 //! +-------------------------------------------------------------------------------+
 //!
-//! PutRecords API Request (max 500 records or 5MB per request)
+//!           PutRecords API Request (max 500 records or 10MB per request)
 //! +------------------------------------------------------------------------------+
 //! | StreamName: "my-stream"                                                      |
 //! | Records: [                                                                   |
 //! |   {                                                                          |
-//! |     Data: <Aggregated Record 1 binary>  // Contains 2 user records          |
-//! |     PartitionKey: "A"                                                        |
+//! |     Data: <Aggregated Record 1 binary>  // Contains 2 user records           |
+//! |     PartitionKey: "key_abc123"                                               |
+//! |     ExplicitHashKey: "12345..." (optional - for shard control)               |
 //! |   },                                                                         |
 //! |   {                                                                          |
-//! |     Data: <Aggregated Record 2 binary>  // Contains 2 user records          |
-//! |     PartitionKey: "B"                                                        |
+//! |     Data: <Aggregated Record 2 binary>  // Contains 2 user records           |
+//! |     PartitionKey: "key_xyz789"                                               |
+//! |     ExplicitHashKey: "67890..." (optional - for shard control)               |
 //! |   },                                                                         |
 //! |   ... (up to 500 aggregated records)                                         |
 //! | ]                                                                            |
 //! +------------------------------------------------------------------------------+
-//!                           |
-//!                           v
+//!                                       |
+//!                                       v
 //! +-------------------------------------------------------------------------------+
 //! |                        AWS KINESIS DATA STREAM                                |
 //! |                                                                               |
 //! |  Shard 1                      Shard 2                      Shard N           |
 //! | +---------+                  +---------+                  +---------+        |
 //! | | Agg 1   |                  | Agg 2   |                  | ...     |        |
-//! | | (2 user)|                  | (2 user)|                  |         |        |
 //! | +---------+                  +---------+                  +---------+        |
 //! +-------------------------------------------------------------------------------+
 //! ```
 //!
-//! ## Benefits of KPL Aggregation
+//! ## Implementation Notes
 //!
-//! - **Improved Throughput**: Pack multiple small records into fewer Kinesis records
-//! - **Cost Reduction**: Pay for fewer PUT operations (Kinesis charges per record)
-//! - **Better Shard Utilization**: More efficient use of shard write capacity (1MB/sec or 1000 records/sec)
-//! - **Deduplication**: Partition keys and explicit hash keys are stored once per aggregate
-//!
-//! ## Format Details
-//!
-//! ### Aggregated Record Structure
-//! ```text
-//! [ 4 bytes Magic ] [ Variable Protobuf Data ] [ 16 bytes MD5 ]
-//! ```
-//!
-//! - **Magic**: `0xF3 0x89 0x9A 0xC2` - Identifies the record as KPL aggregated
-//! - **Protobuf Data**: Protocol Buffer encoded `AggregatedRecord` message
-//! - **MD5 Checksum**: MD5 hash of the protobuf data for integrity verification
-//!
-//! ### Protobuf Schema (simplified)
-//! ```protobuf
-//! message AggregatedRecord {
-//!   repeated string partition_key_table = 1;        // Deduplicated partition keys
-//!   repeated string explicit_hash_key_table = 2;    // Deduplicated explicit hash keys
-//!   repeated Record records = 3;                    // User records with indices
-//! }
-//!
-//! message Record {
-//!   uint64 partition_key_index = 1;                 // Index into partition_key_table
-//!   optional uint64 explicit_hash_key_index = 2;    // Index into explicit_hash_key_table
-//!   bytes data = 3;                                 // User record data
-//!   repeated Tag tags = 4;                          // Optional tags
-//! }
-//! ```
+//! - All records in an aggregate share a single partition key
+//! - The partition key table contains exactly one entry
+//! - All records reference partition_key_index = 0
+//! - explicit_hash_key_table is always empty (not used)
+//! - This ensures the aggregated record is correctly associated with its Kinesis shard
 //!
 //! ## Size Limits
 //!
 //! - **Max Aggregated Record Size**: 950KB (leaves room for overhead under 1MB AWS limit)
-//! - **Max Records per Aggregate**: Configurable (default varies by implementation)
-//! - **Max PutRecords Batch**: 500 records or 5MB total per API call
+//! - **Max Records per Aggregate**: Configurable
+//! - **Max PutRecords Batch**: 500 records or 10MB total per API call
 //! - **Individual User Record**: No specific limit, but must fit within aggregate
 //!
 //! ## References
@@ -148,7 +116,7 @@ use crate::event::{EventFinalizers, Finalizable};
 use bytes::{BufMut, Bytes, BytesMut};
 use md5::{Digest, Md5};
 use prost::Message;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use vector_lib::{ByteSizeOf, request_metadata::RequestMetadata};
 
 // Include the generated protobuf code
@@ -159,18 +127,6 @@ pub mod kpl_proto {
 // KPL Magic bytes - identifies this as a KPL aggregated record
 const KPL_MAGIC: [u8; 4] = [0xF3, 0x89, 0x9A, 0xC2];
 const MAX_AGGREGATE_SIZE: usize = 950_000; // 950KB binary data + overhead < 1MB AWS limit
-
-/// Generate a random partition key for aggregated records.
-/// This uses the same random generation as the non-aggregated path.
-fn generate_partition_key() -> String {
-    use rand::random;
-    random::<[char; 16]>()
-        .iter()
-        .fold(String::new(), |mut s, c| {
-            s.push(*c);
-            s
-        })
-}
 
 /// Individual user record before aggregation
 #[derive(Debug, Clone)]
@@ -401,15 +357,17 @@ impl KplAggregator {
             user_record_count = record_count,
         );
 
-        // Build partition key and explicit hash key tables
+        // Build partition key table
         // Use a single partition key for all records in this aggregate.
         // This matches the Golang KPL implementation: all records in an aggregate
-        // share the same partition key, which saves space in the protobuf and
-        // ensures all records are treated as a cohesive unit.
-        let shared_partition_key = generate_partition_key();
+        // share the same partition key, which ensures the aggregated record is
+        // correctly associated with the Kinesis shard it arrives through.
+        //
+        // Note: We do NOT populate explicit_hash_key_table, matching Golang's behavior.
+        // Explicit hash keys in subrecords are meaningless since shard assignment already
+        // happened at the aggregated record level.
+        let shared_partition_key = crate::sinks::aws_kinesis::sink::gen_partition_key();
         let partition_key_table: Vec<String> = vec![shared_partition_key.clone()];
-        let mut explicit_hash_key_table: Vec<String> = Vec::new();
-        let mut explicit_hash_key_indices: HashMap<String, u64> = HashMap::new();
 
         tracing::trace!(
             message = "Using shared partition key for all records in aggregate",
@@ -422,39 +380,17 @@ impl KplAggregator {
 
         for (idx, user_record) in user_records.iter().enumerate() {
             // All records use the same partition key (index 0)
-            let pk_index = 0u64;
-
-            // Get or insert explicit hash key (if present)
-            let ehk_index = if let Some(ref ehk) = user_record.explicit_hash_key {
-                let idx = if let Some(&idx) = explicit_hash_key_indices.get(ehk) {
-                    idx
-                } else {
-                    let idx = explicit_hash_key_table.len() as u64;
-                    explicit_hash_key_table.push(ehk.clone());
-                    explicit_hash_key_indices.insert(ehk.clone(), idx);
-                    tracing::trace!(
-                        message = "Added new explicit hash key to table",
-                        explicit_hash_key = %ehk,
-                        table_index = idx,
-                    );
-                    idx
-                };
-                Some(idx)
-            } else {
-                None
-            };
-
+            // Explicit hash key is not set (matching Golang implementation)
             tracing::trace!(
                 message = "Adding user record to protobuf",
                 proto_record_index = idx,
-                partition_key_index = pk_index,
-                explicit_hash_key_index = ?ehk_index,
+                partition_key_index = 0,
                 data_size = user_record.data.len(),
             );
 
             proto_records.push(kpl_proto::Record {
-                partition_key_index: pk_index,
-                explicit_hash_key_index: ehk_index,
+                partition_key_index: 0,
+                explicit_hash_key_index: None,
                 data: user_record.data.to_vec(),
                 tags: vec![], // Tags not currently used
             });
@@ -463,14 +399,14 @@ impl KplAggregator {
         tracing::debug!(
             message = "Built KPL protobuf structure",
             partition_key_table_size = partition_key_table.len(),
-            explicit_hash_key_table_size = explicit_hash_key_table.len(),
             proto_records_count = proto_records.len(),
         );
 
         // Create the aggregated record protobuf message
+        // Note: explicit_hash_key_table is left empty, matching Golang implementation
         let aggregated = kpl_proto::AggregatedRecord {
             partition_key_table: partition_key_table.clone(),
-            explicit_hash_key_table: explicit_hash_key_table.clone(),
+            explicit_hash_key_table: vec![],
             records: proto_records,
         };
 
@@ -752,8 +688,12 @@ mod tests {
 
         // The aggregated record should have a partition key (16 random characters)
         let partition_key = &aggregated[0].partition_key;
-        assert_eq!(partition_key.len(), 16,
-            "Partition key should be 16 characters, got: {}", partition_key.len());
+        assert_eq!(
+            partition_key.len(),
+            16,
+            "Partition key should be 16 characters, got: {}",
+            partition_key.len()
+        );
 
         // Verify the protobuf has only ONE partition key (shared by all records)
         let data = &aggregated[0].data;
@@ -762,11 +702,16 @@ mod tests {
 
         // Since we now use a single generated key for all records in the aggregate,
         // the partition key table should only have 1 entry
-        assert_eq!(decoded.partition_key_table.len(), 1,
-            "Partition key table should have exactly 1 entry (all records use same key)");
+        assert_eq!(
+            decoded.partition_key_table.len(),
+            1,
+            "Partition key table should have exactly 1 entry (all records use same key)"
+        );
 
         // All records should reference the same partition key index (0)
-        assert!(decoded.records.iter().all(|r| r.partition_key_index == 0),
-            "All records should reference partition key index 0");
+        assert!(
+            decoded.records.iter().all(|r| r.partition_key_index == 0),
+            "All records should reference partition key index 0"
+        );
     }
 }
