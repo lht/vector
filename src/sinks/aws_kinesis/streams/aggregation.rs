@@ -351,13 +351,19 @@ impl KplAggregator {
             return Err("Cannot create aggregate from empty user_records batch".into());
         }
 
-        // Build partition key table. Use a single partition key for all records in this aggregate.
-        // All records in an aggregate share the same partition key, which ensures the aggregated
-        // record is correctly associated with the Kinesis shard it arrives through.
+        // Build partition key table. Use the first user record's partition key for all records. All
+        // records in an aggregate share the same partition key (from the first record), which
+        // ensures the aggregated record is correctly associated with the Kinesis shard it arrives
+        // through.
+        // Reference: https://github.com/awslabs/amazon-kinesis-client/blob/0478575b3dd3f88a1166ff9cf0bab0cb01916457/amazon-kinesis-client/src/main/java/software/amazon/kinesis/retrieval/AggregatorUtil.java#L74-L78
         //
         // Note: We do NOT populate explicit_hash_key_table. Explicit hash keys in subrecords are
         // meaningless since shard assignment already happened at the aggregated record level.
-        let shared_partition_key = crate::sinks::aws_kinesis::sink::gen_partition_key();
+        let shared_partition_key = user_records
+            .front()
+            .ok_or("user_records is empty")?
+            .partition_key
+            .clone();
         let partition_key_table: Vec<String> = vec![shared_partition_key.clone()];
 
         // Build protobuf records
@@ -399,7 +405,6 @@ impl KplAggregator {
 
         // Collect metadata and finalizers
         // Use the same partition key we already generated for the protobuf
-        let partition_key = shared_partition_key;
         let user_record_count = user_records.len();
 
         let mut combined_finalizers = EventFinalizers::default();
@@ -415,15 +420,15 @@ impl KplAggregator {
         let final_size = buf.len();
         tracing::debug!(
             message = "Finalized aggregated record",
-            partition_key = %partition_key,
+            partition_key = %shared_partition_key,
             user_record_count = user_record_count,
             final_data_size = final_size,
         );
 
         Ok(AggregatedRecord {
             data: buf.freeze(),
-            partition_key,
             user_record_count,
+            partition_key: shared_partition_key,
             finalizers: combined_finalizers,
             metadata: combined_metadata,
         })
