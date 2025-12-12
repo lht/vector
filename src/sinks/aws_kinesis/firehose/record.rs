@@ -52,22 +52,38 @@ impl SendRecord for KinesisFirehoseClient {
         KinesisResponse,
         SdkError<Self::E, aws_smithy_runtime_api::client::orchestrator::HttpResponse>,
     > {
-        let rec_count = records.len();
-        let total_size = records
-            .iter()
-            .fold(0, |acc, record| acc + record.data().as_ref().len());
         self.client
             .put_record_batch()
-            .set_records(Some(records))
+            .set_records(Some(records.clone()))
             .delivery_stream_name(stream_name)
             .send()
             .instrument(info_span!("request").or_current())
             .await
-            .map(|output: PutRecordBatchOutput| KinesisResponse {
-                failure_count: output.failed_put_count() as usize,
-                events_byte_size: CountByteSize(rec_count, JsonSize::new(total_size)).into(),
-                #[cfg(feature = "sinks-aws_kinesis_streams")]
-                failed_records: vec![], // Firehose doesn't support partial failure retry
-            })
+            .map(|output: PutRecordBatchOutput| process_output(output, records))
+    }
+}
+
+fn process_output(output: PutRecordBatchOutput, records: Vec<KinesisRecord>) -> KinesisResponse {
+    let failure_count = output.failed_put_count() as usize;
+    let successful_count = records.len() - failure_count;
+
+    // Calculate successful byte size using zip (AWS guarantees "natural ordering")
+    let successful_size: usize = records
+        .iter()
+        .zip(output.request_responses().iter())
+        .filter_map(|(record, response)| {
+            if response.error_code().is_none() {
+                Some(record.data().as_ref().len())
+            } else {
+                None
+            }
+        })
+        .sum();
+
+    KinesisResponse {
+        failure_count,
+        events_byte_size: CountByteSize(successful_count, JsonSize::new(successful_size)).into(),
+        #[cfg(feature = "sinks-aws_kinesis_streams")]
+        failed_records: vec![], // Firehose doesn't support partial failure retry
     }
 }

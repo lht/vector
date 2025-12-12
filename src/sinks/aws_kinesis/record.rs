@@ -4,6 +4,7 @@ use aws_smithy_runtime_api::client::{orchestrator::HttpResponse, result::SdkErro
 use bytes::Bytes;
 
 use super::KinesisResponse;
+
 /// An AWS Kinesis record type primarily to store the underlying aws crates' actual record `T`, and
 /// to abstract the encoded length calculation.
 pub trait Record {
