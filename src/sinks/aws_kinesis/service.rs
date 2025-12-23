@@ -110,6 +110,14 @@ where
             )
             .collect();
 
+        // Extract user_record_count for each Kinesis Data Streams record before moving them. This
+        // is needed for accurate metrics reporting.
+        let user_record_counts: Vec<usize> = requests
+            .events
+            .iter()
+            .map(|req| req.record.user_record_count())
+            .collect();
+
         let records = requests
             .events
             .into_iter()
@@ -122,19 +130,24 @@ where
         Box::pin(async move {
             let mut response = client.send(records, stream_name).await?;
 
-            // Calculate the byte size for successful events only
-            let successful_size: usize = {
+            // Calculate the byte size and user record count for successful events only.
+            // For KPL aggregation: successful_user_record_count represents the total number of
+            // user records successfully sent, not the number of Kinesis Data Streams records.
+            let (successful_size, successful_user_record_count): (usize, usize) = {
                 if response.failed_records.is_empty() {
-                    // Fast path: no failures, sum all sizes
-                    estimated_json_encoded_sizes.iter().sum()
+                    // Fast path: no failures, sum all sizes and user record counts
+                    (
+                        estimated_json_encoded_sizes.iter().sum(),
+                        user_record_counts.iter().sum(),
+                    )
                 } else {
                     // Build a HashSet of failed indices for O(1) lookup
                     use std::collections::HashSet;
                     let failed_indices: HashSet<usize> =
                         response.failed_records.iter().map(|fr| fr.index).collect();
 
-                    // Sum sizes for all non-failed records
-                    estimated_json_encoded_sizes
+                    // Sum sizes and user record counts for all non-failed Kinesis Data Streams records
+                    let successful_size = estimated_json_encoded_sizes
                         .iter()
                         .enumerate()
                         .filter_map(|(index, size)| {
@@ -144,13 +157,28 @@ where
                                 Some(size)
                             }
                         })
-                        .sum()
+                        .sum();
+
+                    let successful_user_record_count = user_record_counts
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, count)| {
+                            if failed_indices.contains(&index) {
+                                None
+                            } else {
+                                Some(count)
+                            }
+                        })
+                        .sum();
+
+                    (successful_size, successful_user_record_count)
                 }
             };
 
-            let successful_count = estimated_json_encoded_sizes.len() - response.failure_count;
+            // Use user_record_count for the event count metric.
+            // This ensures component_sent_events_total reflects KPL user records, not Kinesis Data Streams records.
             response.events_byte_size =
-                CountByteSize(successful_count, JsonSize::new(successful_size)).into();
+                CountByteSize(successful_user_record_count, JsonSize::new(successful_size)).into();
 
             Ok(response)
         })
@@ -165,8 +193,8 @@ mod tests {
 
     #[test]
     fn test_event_status_delivered_with_partial_success() {
-        // Scenario: 10 events sent, 7 succeeded, 3 failed
-        // events_byte_size reflects only the 7 successful events
+        // Scenario: 10 user records sent, 7 succeeded, 3 failed
+        // events_byte_size reflects only the 7 successful user records
         #[cfg(feature = "sinks-aws_kinesis_streams")]
         let failed_records = vec![
             RecordResult {
@@ -191,7 +219,7 @@ mod tests {
 
         let response = KinesisResponse {
             failure_count: 3,
-            events_byte_size: CountByteSize(7, JsonSize::new(700)).into(), // Only 7 successful
+            events_byte_size: CountByteSize(7, JsonSize::new(700)).into(), // Only 7 successful user records
             #[cfg(feature = "sinks-aws_kinesis_streams")]
             failed_records,
         };
@@ -209,9 +237,12 @@ mod tests {
             "events_rejected should report 3 failed events"
         );
 
-        // Verify events_sent reflects only successful events
+        // Verify events_sent reflects only successful user records
         if let GroupedCountByteSize::Untagged { size } = response.events_sent() {
-            assert_eq!(size.0, 7, "events_sent should report 7 successful events");
+            assert_eq!(
+                size.0, 7,
+                "events_sent should report 7 successful user records"
+            );
         } else {
             panic!("Expected Untagged variant");
         }

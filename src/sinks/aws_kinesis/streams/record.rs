@@ -13,6 +13,15 @@ use crate::sinks::prelude::*;
 #[derive(Clone)]
 pub struct KinesisStreamRecord {
     pub record: KinesisRecord,
+    /// Number of user records (KPL user records) in this Kinesis Data Streams record.
+    ///
+    /// Following AWS terminology:
+    /// - For KPL aggregated records: This is the count of KPL user records aggregated
+    ///   into this single Kinesis Data Streams record.
+    /// - For non-aggregated records: This is always 1 (one user record = one Kinesis record).
+    ///
+    /// Reference: https://docs.aws.amazon.com/streams/latest/dev/kinesis-kpl-concepts.html
+    pub user_record_count: usize,
 }
 
 impl Record for KinesisStreamRecord {
@@ -25,6 +34,8 @@ impl Record for KinesisStreamRecord {
                 .partition_key(partition_key)
                 .build()
                 .expect("all required builder fields set"),
+            // Non-aggregated records always contain 1 user record
+            user_record_count: 1,
         }
     }
 
@@ -43,12 +54,20 @@ impl Record for KinesisStreamRecord {
         data_len.div_ceil(3) * 4 + hash_key_size + key_len + 10
     }
 
+    fn user_record_count(&self) -> usize {
+        self.user_record_count
+    }
+
     fn get(self) -> Self::T {
         self.record
     }
 }
 
 impl KinesisStreamRecord {
+    /// Creates a Kinesis Data Streams record from a KPL aggregated record.
+    ///
+    /// The aggregated record contains multiple KPL user records that have been
+    /// packed together using the KPL aggregation format.
     pub fn from_aggregated(aggregated: &super::aggregation::AggregatedRecord) -> Self {
         Self {
             record: KinesisRecord::builder()
@@ -56,6 +75,8 @@ impl KinesisStreamRecord {
                 .partition_key(&aggregated.partition_key)
                 .build()
                 .expect("all required builder fields set"),
+            // Store the actual number of KPL user records in this Kinesis Data Streams record
+            user_record_count: aggregated.user_record_count,
         }
     }
 }

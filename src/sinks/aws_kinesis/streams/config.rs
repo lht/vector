@@ -64,6 +64,57 @@ impl SinkBatchSettings for KinesisDefaultBatchSettings {
     const TIMEOUT_SECS: f64 = 1.0;
 }
 
+/// Default value for max_events in KPL aggregation
+const fn default_kpl_max_events() -> usize {
+    100
+}
+
+/// Configuration for KPL (Kinesis Producer Library) aggregation.
+///
+/// When enabled, multiple user records (KPL user records) are packed into single
+/// Kinesis Data Streams records to improve throughput and reduce API calls.
+#[configurable_component]
+#[derive(Clone, Copy, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct AggregationConfig {
+    /// Enable KPL aggregation.
+    ///
+    /// When enabled, multiple user records are packed into single Kinesis Data Streams records
+    /// to improve throughput and reduce API calls. Records are aggregated up to the
+    /// specified limits, with the first record's partition key used for the entire
+    /// aggregate. This may cause records with different partition keys to be routed
+    /// to the same shard.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Maximum number of user records to aggregate into a single Kinesis Data Streams record.
+    ///
+    /// Higher values improve throughput but increase latency and retry payload size.
+    /// Must be between 1 and 1000.
+    #[serde(default = "default_kpl_max_events")]
+    #[configurable(metadata(docs::type_unit = "events"))]
+    pub max_events: usize,
+}
+
+impl Default for AggregationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_events: default_kpl_max_events(),
+        }
+    }
+}
+
+impl AggregationConfig {
+    /// Validates the KPL aggregation configuration.
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.enabled && (self.max_events == 0 || self.max_events > 1000) {
+            return Err("aggregation.max_events must be between 1 and 1000".into());
+        }
+        Ok(())
+    }
+}
+
 /// Configuration for the `aws_kinesis_streams` sink.
 #[configurable_component(sink(
     "aws_kinesis_streams",
@@ -78,40 +129,13 @@ pub struct KinesisStreamsSinkConfig {
     #[serde(default)]
     pub batch: BatchConfig<KinesisDefaultBatchSettings>,
 
-    /// Enable KPL (Kinesis Producer Library) style aggregation.
-    ///
-    /// When enabled, multiple user records are packed into single Kinesis records
-    /// to improve throughput and reduce API calls. Records are aggregated up to the
-    /// specified limits, with the first record's partition key used for the entire
-    /// aggregate. This may cause records with different partition keys to be routed
-    /// to the same shard.
+    /// KPL aggregation configuration.
+    #[configurable(derived)]
     #[serde(default)]
-    #[configurable(metadata(docs::advanced))]
-    pub enable_aggregation: bool,
-
-    /// Maximum number of user records to aggregate into a single Kinesis record.
-    ///
-    /// Higher values improve throughput but increase latency and retry payload size.
-    /// Must be between 1 and 1000. Only used when `enable_aggregation` is true.
-    #[serde(default = "default_max_records_per_aggregate")]
-    #[configurable(metadata(docs::advanced))]
-    pub max_records_per_aggregate: usize,
-}
-
-fn default_max_records_per_aggregate() -> usize {
-    100
+    pub aggregation: AggregationConfig,
 }
 
 impl KinesisStreamsSinkConfig {
-    fn validate_aggregation_config(&self) -> crate::Result<()> {
-        if self.enable_aggregation {
-            if self.max_records_per_aggregate == 0 || self.max_records_per_aggregate > 1000 {
-                return Err("max_records_per_aggregate must be between 1 and 1000".into());
-            }
-        }
-        Ok(())
-    }
-
     async fn healthcheck(self, client: KinesisClient) -> crate::Result<()> {
         let stream_name = self.base.stream_name;
 
@@ -157,8 +181,8 @@ impl KinesisStreamsSinkConfig {
 #[typetag::serde(name = "aws_kinesis_streams")]
 impl SinkConfig for KinesisStreamsSinkConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        // Validate aggregation config
-        self.validate_aggregation_config()?;
+        // Validate KPL aggregation config
+        self.aggregation.validate()?;
 
         let client = self.create_client(&cx.proxy).await?;
         let healthcheck = self.clone().healthcheck(client.clone()).boxed();
@@ -195,8 +219,8 @@ impl SinkConfig for KinesisStreamsSinkConfig {
         let serializer = self.base.encoding.build()?;
         let encoder = Encoder::<()>::new(serializer);
 
-        let aggregator = if self.enable_aggregation {
-            Some(KplAggregator::new(self.max_records_per_aggregate))
+        let aggregator = if self.aggregation.enabled {
+            Some(KplAggregator::new(self.aggregation.max_events))
         } else {
             None
         };
@@ -290,49 +314,48 @@ impl RetryLogic for KinesisRetryLogic {
                     original_request.metadata.accumulated_successful_bytes(),
                 );
 
+                // Build a HashSet of failed indices for O(1) lookup
+                use std::collections::HashSet;
+                let failed_indices: HashSet<usize> =
+                    failed_records.iter().map(|fr| fr.index).collect();
+
                 // Calculate successful events byte size from the original request
                 // Use failed_records indices to determine which events succeeded
-                let successful_size: usize = if failed_records.is_empty() {
-                    // Fast path: all succeeded (shouldn't happen here, but handle it)
-                    original_request
-                        .events
-                        .iter()
-                        .map(|req| {
-                            match req.get_metadata().events_estimated_json_encoded_byte_size() {
+                let successful_size: usize = original_request
+                    .events
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, req)| {
+                        if failed_indices.contains(&index) {
+                            None
+                        } else {
+                            let size = match req
+                                .get_metadata()
+                                .events_estimated_json_encoded_byte_size()
+                            {
                                 GroupedCountByteSize::Untagged { size } => size.1.get(),
                                 GroupedCountByteSize::Tagged { .. } => 0,
-                            }
-                        })
-                        .sum()
-                } else {
-                    // Build a HashSet of failed indices for O(1) lookup
-                    use std::collections::HashSet;
-                    let failed_indices: HashSet<usize> =
-                        failed_records.iter().map(|fr| fr.index).collect();
+                            };
+                            Some(size)
+                        }
+                    })
+                    .sum();
 
-                    // Sum sizes for successful events only
-                    original_request
-                        .events
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, req)| {
-                            if failed_indices.contains(&index) {
-                                None
-                            } else {
-                                let size = match req
-                                    .get_metadata()
-                                    .events_estimated_json_encoded_byte_size()
-                                {
-                                    GroupedCountByteSize::Untagged { size } => size.1.get(),
-                                    GroupedCountByteSize::Tagged { .. } => 0,
-                                };
-                                Some(size)
-                            }
-                        })
-                        .sum()
-                };
-
-                let successful_count = original_request.events.len() - failed_records.len();
+                // Calculate successful count by summing user_record_count for successful events.
+                // This properly accounts for KPL aggregated records which may contain multiple
+                // KPL user records per Kinesis Data Streams record.
+                let successful_count: usize = original_request
+                    .events
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, req)| {
+                        if failed_indices.contains(&index) {
+                            None
+                        } else {
+                            Some(req.record.user_record_count)
+                        }
+                    })
+                    .sum();
 
                 // Accumulate the successful events from this attempt into the retry metadata
                 metadata.accumulate_success(successful_count, successful_size);
@@ -414,6 +437,8 @@ mod tests {
         // - Second retry request should:
         //   1. Only contain the 1 failed event
         //   2. Accumulate 9 successful events (900 bytes) total
+        //
+        // Note: Each KinesisStreamRecord has user_record_count=1 (non-aggregated)
 
         let retry_logic = KinesisRetryLogic {
             retry_partial: true,
@@ -568,6 +593,127 @@ mod tests {
                 }
             }
             _ => panic!("Expected RetryPartial action for first attempt"),
+        }
+    }
+
+    #[test]
+    fn test_kpl_aggregated_records_user_count() {
+        // This test verifies that KPL aggregated records properly track user_record_count
+        // and that successful count calculation accounts for multiple KPL user records per
+        // Kinesis Data Streams record.
+        //
+        // Scenario:
+        // - Initial request: 3 Kinesis Data Streams records (aggregated) containing 2, 3, and 5 KPL user records respectively
+        // - First attempt: 2 Kinesis records succeed (containing 2+3=5 user records), 1 fails (containing 5 user records)
+        // - Retry request should accumulate 5 successful KPL user records (not 2 Kinesis Data Streams records)
+
+        let retry_logic = KinesisRetryLogic {
+            retry_partial: true,
+        };
+
+        // Helper to create a KinesisRequest with custom user_record_count
+        fn create_aggregated_kinesis_request(
+            index: usize,
+            byte_size: usize,
+            user_record_count: usize,
+        ) -> KinesisRequest<KinesisStreamRecord> {
+            let metadata = RequestMetadata::new(
+                1, // metadata tracks 1 Kinesis record
+                byte_size,
+                byte_size,
+                byte_size,
+                CountByteSize(1, JsonSize::new(byte_size)).into(),
+            );
+
+            let mut request = KinesisRequestBuilder::<KinesisStreamRecord> {
+                compression: Compression::None,
+                encoder: (Default::default(), Default::default()),
+                _phantom: PhantomData,
+            }
+            .build_request(
+                KinesisMetadata {
+                    finalizers: Default::default(),
+                    partition_key: format!("key-{}", index),
+                },
+                metadata,
+                EncodeResult::uncompressed(
+                    bytes::Bytes::from(vec![index as u8; byte_size]),
+                    CountByteSize(1, JsonSize::new(byte_size)).into(),
+                ),
+            );
+
+            // Override user_record_count to simulate KPL aggregation
+            request.record.user_record_count = user_record_count;
+            request
+        }
+
+        // Create request with 3 aggregated Kinesis Data Streams records:
+        // - Record 0: contains 2 KPL user records, 200 bytes
+        // - Record 1: contains 3 KPL user records, 300 bytes
+        // - Record 2: contains 5 KPL user records, 500 bytes
+        // Total: 10 KPL user records across 3 Kinesis Data Streams records
+        let initial_events = vec![
+            create_aggregated_kinesis_request(0, 200, 2),
+            create_aggregated_kinesis_request(1, 300, 3),
+            create_aggregated_kinesis_request(2, 500, 5),
+        ];
+
+        let initial_metadata = RequestMetadata::from_batch(
+            initial_events.iter().map(|req| req.get_metadata().clone()),
+        );
+
+        let initial_request = BatchKinesisRequest {
+            events: initial_events,
+            metadata: initial_metadata,
+        };
+
+        // First response: records 0 and 1 succeed (5 user records), record 2 fails (5 user records)
+        let first_response = KinesisResponse {
+            failure_count: 1,
+            events_byte_size: CountByteSize(5, JsonSize::new(500)).into(), // 5 user records succeeded (2+3)
+            failed_records: vec![RecordResult {
+                index: 2,
+                success: false,
+                error_code: Some("ProvisionedThroughputExceededException".to_string()),
+                error_message: Some("Rate exceeded".to_string()),
+            }],
+        };
+
+        let retry_action = retry_logic.should_retry_response(&first_response);
+
+        match retry_action {
+            RetryAction::RetryPartial(retry_fn) => {
+                let retry_request = retry_fn(initial_request);
+
+                // Verify retry request contains only 1 failed Kinesis record
+                assert_eq!(
+                    retry_request.events.len(),
+                    1,
+                    "Retry should contain 1 failed Kinesis record"
+                );
+
+                // Verify the failed record has the correct user_record_count
+                assert_eq!(
+                    retry_request.events[0].record.user_record_count, 5,
+                    "Failed record should contain 5 user records"
+                );
+
+                // Verify accumulated counters account for user records, not Kinesis records
+                // Should accumulate 5 user records (2+3), not 2 Kinesis records
+                assert_eq!(
+                    retry_request.metadata.accumulated_successful_events(),
+                    5,
+                    "Should accumulate 5 successful user records (2+3), not 2 Kinesis records"
+                );
+
+                // Verify accumulated bytes (200+300=500)
+                assert_eq!(
+                    retry_request.metadata.accumulated_successful_bytes(),
+                    500,
+                    "Should accumulate 500 bytes from successful records"
+                );
+            }
+            _ => panic!("Expected RetryPartial action"),
         }
     }
 }

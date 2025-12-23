@@ -15,6 +15,9 @@ pub trait Record {
     /// Returns the encoded length of the record.
     fn encoded_length(&self) -> usize;
 
+    /// Returns the number of user records contained in this Kinesis Data Streams record.
+    fn user_record_count(&self) -> usize;
+
     /// Moves the contained record to the caller.
     fn get(self) -> Self::T;
 }

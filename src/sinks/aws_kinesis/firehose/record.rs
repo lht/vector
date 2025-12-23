@@ -30,6 +30,11 @@ impl Record for KinesisFirehoseRecord {
         data_len.div_ceil(3) * 4 + 3
     }
 
+    fn user_record_count(&self) -> usize {
+        // Firehose doesn't support KPL aggregation, so always 1
+        1
+    }
+
     fn get(self) -> Self::T {
         self.record
     }

@@ -1,8 +1,27 @@
 //! # Kinesis Producer Library (KPL) Aggregation Format
 //!
 //! This module implements the KPL aggregation format for AWS Kinesis streams.
-//! KPL aggregation allows multiple user records to be packed into a single Kinesis record,
+//! KPL aggregation allows multiple user records to be packed into a single Kinesis Data Streams record,
 //! improving throughput and reducing costs.
+//!
+//! ## Terminology
+//!
+//! Following AWS documentation conventions, we distinguish between two types of records:
+//!
+//! - **User record** (or KPL user record): An individual record from the application that is submitted
+//!   to the KPL for aggregation. This is the logical unit of data from the application's perspective.
+//!   In this codebase, these are represented by the `UserRecord` struct.
+//!
+//! - **Kinesis Data Streams record** (or Kinesis record): The actual record stored in a Kinesis stream.
+//!   When KPL aggregation is enabled, one Kinesis Data Streams record may contain multiple user records.
+//!   In this codebase, these are represented by `AggregatedRecord` (when using KPL) or
+//!   `KinesisStreamRecord` (the final format sent to AWS).
+//!
+//! When we use the term "record" without qualification in this module, we refer to a user record.
+//! When referring to Kinesis Data Streams records, we explicitly say "Kinesis Data Streams record"
+//! or "Kinesis record".
+//!
+//! **Reference**: [AWS KPL Concepts](https://docs.aws.amazon.com/streams/latest/dev/kinesis-kpl-concepts.html)
 //!
 //! ## KPL Aggregation Overview
 //!
@@ -142,7 +161,11 @@ const PROTOBUF_BASE_OVERHEAD: usize = 80;
 //   - Total: 6 bytes, rounded to 8 for safety buffer
 const PROTOBUF_PER_RECORD_OVERHEAD: usize = 8;
 
-/// Individual user record before aggregation
+/// Individual user record before aggregation.
+///
+/// This represents a single logical record from the application's perspective.
+/// Multiple user records can be aggregated into a single Kinesis Data Streams record
+/// for improved throughput and cost efficiency.
 #[derive(Debug, Clone)]
 pub struct UserRecord {
     /// Data payload
@@ -158,7 +181,7 @@ pub struct UserRecord {
 impl UserRecord {
     /// Calculate the estimated encoded size of this record in protobuf format.
     /// This is an approximation used for buffer size calculations.
-    pub fn encoded_size(&self) -> usize {
+    pub const fn encoded_size(&self) -> usize {
         // Only the data is encoded in the protobuf, plus minimal overhead
         self.data.len() + 20 // data + overhead estimate
     }
@@ -170,14 +193,18 @@ impl Finalizable for UserRecord {
     }
 }
 
-/// Aggregated record containing multiple user records
+/// Aggregated record containing multiple user records in KPL format.
+///
+/// This represents a Kinesis Data Streams record that has been created by aggregating
+/// multiple user records together. The record contains KPL-formatted binary data
+/// (magic bytes + protobuf + checksum) that can be de-aggregated by KPL-aware consumers.
 #[derive(Debug, Clone)]
 pub struct AggregatedRecord {
     /// KPL-formatted data: magic + records + checksum
     pub data: Bytes,
     /// Partition key from the first user record
     pub partition_key: String,
-    /// Number of user records in this aggregate
+    /// Number of user records in this Kinesis Data Streams record
     pub user_record_count: usize,
     /// Combined finalizers from all user records
     pub finalizers: EventFinalizers,
@@ -198,14 +225,14 @@ pub struct KplAggregator {
 }
 
 impl KplAggregator {
-    pub fn new(max_records_per_aggregate: usize) -> Self {
+    pub const fn new(max_records_per_aggregate: usize) -> Self {
         Self {
             max_records_per_aggregate,
         }
     }
 
     /// Returns the maximum number of records per aggregate
-    pub fn max_records_per_aggregate(&self) -> usize {
+    pub const fn max_records_per_aggregate(&self) -> usize {
         self.max_records_per_aggregate
     }
 
@@ -213,7 +240,7 @@ impl KplAggregator {
     ///
     /// This estimates the size of the final Kinesis record after KPL encoding,
     /// including magic bytes, protobuf structure, and MD5 checksum.
-    fn estimate_kpl_size(&self, user_data_size: usize, record_count: usize) -> usize {
+    const fn estimate_kpl_size(&self, user_data_size: usize, record_count: usize) -> usize {
         user_data_size
             + KPL_FIXED_OVERHEAD
             + PROTOBUF_BASE_OVERHEAD
@@ -238,7 +265,9 @@ impl KplAggregator {
                 if !current_batch.is_empty() {
                     match self.create_aggregated_record(&mut current_batch) {
                         Ok(aggregated) => aggregated_records.push(aggregated),
-                        Err(e) => tracing::error!(message = "Failed to create aggregated record", error = %e),
+                        Err(e) => {
+                            tracing::error!(message = "Failed to create aggregated record", error = %e)
+                        }
                     }
                     current_data_size = 0;
                 }
@@ -255,7 +284,9 @@ impl KplAggregator {
                         );
                         aggregated_records.push(aggregated);
                     }
-                    Err(e) => tracing::error!(message = "Failed to create single-record aggregate", error = %e),
+                    Err(e) => {
+                        tracing::error!(message = "Failed to create single-record aggregate", error = %e)
+                    }
                 }
                 continue;
             }
@@ -292,7 +323,9 @@ impl KplAggregator {
                     Ok(aggregated) => {
                         aggregated_records.push(aggregated);
                     }
-                    Err(e) => tracing::error!(message = "Failed to create aggregated record", error = %e),
+                    Err(e) => {
+                        tracing::error!(message = "Failed to create aggregated record", error = %e)
+                    }
                 }
                 current_data_size = 0;
             }
@@ -318,7 +351,9 @@ impl KplAggregator {
                 Ok(aggregated) => {
                     aggregated_records.push(aggregated);
                 }
-                Err(e) => tracing::error!(message = "Failed to create final aggregated record", error = %e),
+                Err(e) => {
+                    tracing::error!(message = "Failed to create final aggregated record", error = %e)
+                }
             }
         }
 
@@ -331,7 +366,7 @@ impl KplAggregator {
             0.0
         };
 
-        tracing::info!(
+        tracing::debug!(
             message = "KPL aggregation complete",
             input_records = total_input_records,
             output_aggregated_records = total_output_records,
@@ -388,7 +423,8 @@ impl KplAggregator {
 
         // Serialize the protobuf message
         let mut protobuf_data = Vec::new();
-        aggregated.encode(&mut protobuf_data)
+        aggregated
+            .encode(&mut protobuf_data)
             .map_err(|e| format!("Failed to encode KPL protobuf: {}", e))?;
 
         // Build the final KPL format: [magic][protobuf][md5]
@@ -398,7 +434,8 @@ impl KplAggregator {
         hasher.update(&protobuf_data);
         let checksum = hasher.finalize();
 
-        let mut buf = BytesMut::with_capacity(KPL_MAGIC.len() + protobuf_data.len() + checksum.len());
+        let mut buf =
+            BytesMut::with_capacity(KPL_MAGIC.len() + protobuf_data.len() + checksum.len());
         buf.put_slice(&KPL_MAGIC);
         buf.put_slice(&protobuf_data);
         buf.put_slice(&checksum);
