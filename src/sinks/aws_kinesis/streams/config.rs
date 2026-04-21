@@ -6,11 +6,13 @@ use futures::FutureExt;
 use snafu::Snafu;
 use vector_lib::configurable::{component::GenerateConfig, configurable_component};
 
+use bytes::Bytes;
+
 use super::aggregation::KplAggregator;
 use super::sink::KinesisStreamsSink;
 use super::{
-    KinesisClient, KinesisError, KinesisRecord, KinesisResponse, KinesisSinkBaseConfig,
-    base_sink::{BatchKinesisRequest, KinesisSink},
+    KinesisClient, KinesisError, KinesisRecord, KinesisResponse, KinesisSinkBaseConfig, Record,
+    base_sink::{BatchKinesisRequest, KinesisKey, KinesisSink, gen_partition_key},
     record::{KinesisStreamClient, KinesisStreamRecord},
     request_builder::KinesisRequestBuilder,
 };
@@ -203,6 +205,7 @@ impl SinkConfig for KinesisStreamsSinkConfig {
                 request_limits,
                 KinesisRetryLogic {
                     retry_partial: self.base.request_retry_partial,
+                    has_partition_key_field: self.base.partition_key_field.is_some(),
                 },
             )
             .service(
@@ -269,6 +272,11 @@ impl GenerateConfig for KinesisStreamsSinkConfig {
 #[derive(Default, Clone)]
 struct KinesisRetryLogic {
     retry_partial: bool,
+    /// When true, the user configured an explicit `partition_key_field`, so we
+    /// must preserve the original partition key on retry.  When false the key
+    /// was randomly generated and can safely be re-randomized to target a
+    /// different shard.
+    has_partition_key_field: bool,
 }
 
 impl RetryLogic for KinesisRetryLogic {
@@ -297,11 +305,29 @@ impl RetryLogic for KinesisRetryLogic {
     fn should_retry_response(&self, response: &Self::Response) -> RetryAction<Self::Request> {
         if response.failure_count > 0 && self.retry_partial && !response.failed_records.is_empty() {
             let failed_records = response.failed_records.clone();
+            let regenerate_keys = !self.has_partition_key_field;
 
             RetryAction::RetryPartial(Box::new(move |original_request| {
                 let failed_events: Vec<_> = failed_records
                     .iter()
-                    .filter_map(|r| original_request.events.get(r.index).cloned())
+                    .filter_map(|r| {
+                        original_request.events.get(r.index).cloned().map(|mut req| {
+                            // When no explicit partition_key_field was configured the
+                            // original key was randomly generated. Re-randomize it so
+                            // the retry has a chance of landing on a different (non-
+                            // throttled) shard.
+                            if regenerate_keys {
+                                let new_key = gen_partition_key();
+                                let payload =
+                                    Bytes::from(req.record.record.data.as_ref().to_vec());
+                                req.record = KinesisStreamRecord::new(&payload, &new_key);
+                                req.key = KinesisKey {
+                                    partition_key: new_key,
+                                };
+                            }
+                            req
+                        })
+                    })
                     .collect();
 
                 let mut metadata = RequestMetadata::from_batch(
@@ -442,6 +468,7 @@ mod tests {
 
         let retry_logic = KinesisRetryLogic {
             retry_partial: true,
+            has_partition_key_field: true,
         };
 
         // Create initial request with 10 events (100 bytes each)
@@ -609,6 +636,7 @@ mod tests {
 
         let retry_logic = KinesisRetryLogic {
             retry_partial: true,
+            has_partition_key_field: true,
         };
 
         // Helper to create a KinesisRequest with custom user_record_count
@@ -714,6 +742,116 @@ mod tests {
                 );
             }
             _ => panic!("Expected RetryPartial action"),
+        }
+    }
+
+    fn create_test_kinesis_request_with_key(
+        payload: &[u8],
+        partition_key: &str,
+    ) -> KinesisRequest<KinesisStreamRecord> {
+        let byte_size = payload.len();
+        let metadata = RequestMetadata::new(
+            1,
+            byte_size,
+            byte_size,
+            byte_size,
+            CountByteSize(1, JsonSize::new(byte_size)).into(),
+        );
+
+        KinesisRequestBuilder::<KinesisStreamRecord> {
+            compression: Compression::None,
+            encoder: (Default::default(), Default::default()),
+            _phantom: PhantomData,
+        }
+        .build_request(
+            KinesisMetadata {
+                finalizers: Default::default(),
+                partition_key: partition_key.to_string(),
+            },
+            metadata,
+            EncodeResult::uncompressed(
+                bytes::Bytes::from(payload.to_vec()),
+                CountByteSize(1, JsonSize::new(byte_size)).into(),
+            ),
+        )
+    }
+
+    #[test]
+    fn retry_regenerates_partition_key_when_no_partition_key_field() {
+        let retry_logic = KinesisRetryLogic {
+            retry_partial: true,
+            has_partition_key_field: false,
+        };
+
+        let original_key = "original-random-key";
+        let events = vec![create_test_kinesis_request_with_key(b"hello", original_key)];
+        let metadata =
+            RequestMetadata::from_batch(events.iter().map(|r| r.get_metadata().clone()));
+        let batch = BatchKinesisRequest { events, metadata };
+
+        let response = KinesisResponse {
+            failure_count: 1,
+            events_byte_size: Default::default(),
+            failed_records: vec![RecordResult {
+                index: 0,
+                success: false,
+                error_code: Some("ProvisionedThroughputExceededException".to_string()),
+                error_message: Some("Rate exceeded".to_string()),
+            }],
+        };
+
+        match retry_logic.should_retry_response(&response) {
+            RetryAction::RetryPartial(modify) => {
+                let retried = modify(batch);
+                assert_eq!(retried.events.len(), 1);
+                assert_ne!(
+                    retried.events[0].key.partition_key, original_key,
+                    "partition key should be re-randomized on retry"
+                );
+                assert_eq!(
+                    retried.events[0].record.record.data.as_ref(),
+                    b"hello",
+                    "payload data must be preserved"
+                );
+            }
+            other => panic!("expected RetryPartial, got {:?}", other.is_retryable()),
+        }
+    }
+
+    #[test]
+    fn retry_preserves_partition_key_when_partition_key_field_set() {
+        let retry_logic = KinesisRetryLogic {
+            retry_partial: true,
+            has_partition_key_field: true,
+        };
+
+        let user_key = "user-specified-key";
+        let events = vec![create_test_kinesis_request_with_key(b"hello", user_key)];
+        let metadata =
+            RequestMetadata::from_batch(events.iter().map(|r| r.get_metadata().clone()));
+        let batch = BatchKinesisRequest { events, metadata };
+
+        let response = KinesisResponse {
+            failure_count: 1,
+            events_byte_size: Default::default(),
+            failed_records: vec![RecordResult {
+                index: 0,
+                success: false,
+                error_code: Some("ProvisionedThroughputExceededException".to_string()),
+                error_message: Some("Rate exceeded".to_string()),
+            }],
+        };
+
+        match retry_logic.should_retry_response(&response) {
+            RetryAction::RetryPartial(modify) => {
+                let retried = modify(batch);
+                assert_eq!(retried.events.len(), 1);
+                assert_eq!(
+                    retried.events[0].key.partition_key, user_key,
+                    "partition key should be preserved when partition_key_field is configured"
+                );
+            }
+            other => panic!("expected RetryPartial, got {:?}", other.is_retryable()),
         }
     }
 }
